@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+venv/
+env/
+
+# Model weights
+*.pt
+*.pth
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Snapshots
+static/snapshots/
+
