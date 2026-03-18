@@ -21,32 +21,29 @@ from detection.yolo_detector import YOLODetector
 
 app = Flask(__name__)
 
-# ─── Per-object state ─────────────────────────────────────────────────────────
-person_states  = {}
-vehicle_states = {}
+# ─── Per-object state ────────────────────────────────────────────────────────────
+person_states  = {}   # track_id → intrusion / loiter state
+vehicle_states = {}   # track_id → velocity / heading / accident state
 event_logs     = []
 
-# ─── Cooldowns ────────────────────────────────────────────────────────────────
+# ─── Cooldown timestamps ─────────────────────────────────────────────────────────
 last_intrusion_time = 0
 last_crowd_log_time = 0
 last_fire_log_time  = 0
 last_fall_log_time  = 0
 last_accident_time  = 0
 
-# ─── Person / Intrusion ───────────────────────────────────────────────────────
+# ─── Feature constants ───────────────────────────────────────────────────────────
 INTRUSION_COOLDOWN       = 5
 LOITERING_TIME_THRESHOLD = 10
 
-# ─── Crowd ────────────────────────────────────────────────────────────────────
 CROWD_THRESHOLD         = 5
 CROWD_COOLDOWN          = 10
 crowd_detection_enabled = False
 
-# ─── Fire ─────────────────────────────────────────────────────────────────────
 fire_detection_enabled = False
 FIRE_LOG_COOLDOWN      = 10
 
-# ─── Fall ─────────────────────────────────────────────────────────────────────
 fall_detection_enabled     = False
 FALL_LOG_COOLDOWN          = 10
 FALL_SHOULDER_SPREAD_RATIO = 0.15
@@ -55,71 +52,45 @@ FALL_SPREAD_RATIO          = 1.4
 FALL_CONFIRM_FRAMES        = 4
 MIN_KEYPOINT_VISIBILITY    = 0.4
 
-# ─── Accident ─────────────────────────────────────────────────────────────────
 accident_detection_enabled = False
-ACCIDENT_LOG_COOLDOWN      = 15
+ACCIDENT_LOG_COOLDOWN      = 15   # seconds between accident log entries
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — HYBRID DETECTION THRESHOLDS
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Accident detection thresholds ────────────────────────────────────────────────
 
-# ── Stage 1: Bounding box IoU trigger ────────────────────────────────────────
-# This is the TRIGGER for segmentation, not the final confirmation.
-# When two vehicle boxes overlap beyond this → extract their pixel masks.
-# Calibrated from video: normal traffic max IoU = 0.20, accident IoU = 0.62
-# Set at 0.30 — safely above normal traffic noise
-BOX_IOU_SEG_TRIGGER        = 0.30
+# Signal 1 — IoU overlap between two vehicle boxes (collision proximity)
+COLLISION_IOU_THRESHOLD    = 0.15  # boxes overlap by this fraction → suspicious
 
-# ── Stage 2: Pixel mask intersection (the real collision check) ───────────────
-# After masks are extracted, compute:
-#   overlap_pixels / min(mask_A_pixels, mask_B_pixels)
-# This ratio tells us what fraction of the SMALLER vehicle is overlapping.
-# Two cars side-by-side: boxes overlap, masks DON'T → ratio near 0 → no alert
-# Two cars colliding:    boxes overlap, masks DO  → ratio > threshold → alert
-MASK_OVERLAP_THRESHOLD     = 0.15   # 15% of smaller vehicle's pixels overlap
-
-# ── Velocity drop (Signal 2 — unchanged, calibrated from video) ──────────────
-# Video measured: centroid velocity median = 4.12 px/frame
-VELOCITY_BASELINE_FRAMES   = 8
+# Signal 2 — Sudden velocity drop (post-impact stoppage)
+# Vehicle must have been moving at least this fast (px/frame) before stopping
 MIN_MOVING_VELOCITY        = 3.0
-VELOCITY_DROP_RATIO        = 0.20
-VELOCITY_BASELINE_MAX_STD  = 5.0
+# Velocity must drop to below this to count as "stopped"
+STOPPED_VELOCITY           = 1.0
 
-# ── Trajectory deviation (Signal 3) ──────────────────────────────────────────
+# Signal 3 — Trajectory deviation (off-road / sharp swerve)
+# Heading angle change in degrees between consecutive frames
 HEADING_CHANGE_THRESHOLD   = 45.0
-HEADING_SUSTAINED_FRAMES   = 2
 
-# ── Person-vehicle impact (Signal 4) ─────────────────────────────────────────
-PERSON_VEHICLE_OVERLAP_PAD = 20
-PERSON_DECEL_RATIO         = 0.5
+# Signal 4 — Person inside vehicle bounding box (pedestrian hit)
+# Fraction of person centroid proximity to vehicle box
+PERSON_VEHICLE_OVERLAP_PAD = 20   # pixels padding around vehicle box
 
-# ── Bbox deformation (Signal 5) ──────────────────────────────────────────────
-BBOX_RATIO_CHANGE          = 0.5
+# Signal 5 — Bounding box aspect ratio sudden change (deformation / spin)
+BBOX_RATIO_CHANGE          = 0.5  # abs difference in W:H ratio across frames
 
-# ── Multi-signal confirmation gate ───────────────────────────────────────────
-# MASK_COLLISION counts as Signal 1.
-# Need 1 more signal from {VELOCITY_DROP, TRAJECTORY_DEV,
-#                           PEDESTRIAN_HIT, BBOX_DEFORM}
-MIN_SIGNALS_REQUIRED       = 2
-ACCIDENT_CONFIRM_FRAMES    = 4
+# Temporal gate — how many consecutive frames signals must persist
+ACCIDENT_CONFIRM_FRAMES    = 5
 
-# ── Segmentation metrics (for dashboard / viva demo) ─────────────────────────
-seg_metrics = {
-    "seg_triggers":    0,   # how many times box IoU triggered mask extraction
-    "mask_collisions": 0,   # how many times mask intersection confirmed contact
-    "fp_eliminated":   0,   # box IoU fired but mask said NO → FP eliminated
-}
-
-# ─── YOLO vehicle classes ─────────────────────────────────────────────────────
-VEHICLE_CLASSES = {1, 2, 3, 5, 7}
+# YOLO COCO class IDs for vehicles
+VEHICLE_CLASSES = {1, 2, 3, 5, 7}   # bicycle, car, motorcycle, bus, truck
 VEHICLE_LABELS  = {
     1: "BICYCLE", 2: "CAR", 3: "MOTORCYCLE", 5: "BUS", 7: "TRUCK"
 }
+# ──────────────────────────────────────────────────────────────────────────────────
 
-# ─── ROI ──────────────────────────────────────────────────────────────────────
+# ROI
 roi_polygon = None
 
-# ─── Snapshot ─────────────────────────────────────────────────────────────────
+# Snapshot
 SNAPSHOT_DIR = os.path.join(BASE_DIR, "static", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
@@ -131,10 +102,12 @@ last_snapshot_time = {
     "CROWD":     0, "FALL": 0,
     "ACCIDENT":  0,
 }
-SNAPSHOT_COOLDOWN  = 10
+SNAPSHOT_COOLDOWN = 10
+
+# Consecutive-frame counters
 fall_frame_counter = 0
 
-# ─── MediaPipe Pose ───────────────────────────────────────────────────────────
+# MediaPipe Pose
 pose_model = MediaPipePose(
     static_image_mode=False,
     model_complexity=0,
@@ -151,20 +124,24 @@ KP_RIGHT_HIP      = 24
 KP_LEFT_ANKLE     = 27
 KP_RIGHT_ANKLE    = 28
 
-# ─── Video ────────────────────────────────────────────────────────────────────
-cap = cv2.VideoCapture("../data/CLASS.mp4")
-#cap = cv2.VideoCapture(0)
+# Video
+cap = cv2.VideoCapture("../data/CLIP1.mp4")
+#cap      = cv2.VideoCapture(0)
 detector = YOLODetector()
 
-# ─── Metrics ──────────────────────────────────────────────────────────────────
 metrics = {
-    "fps": 0, "latency_ms": 0, "person_count": 0,
-    "crowd_alerts": 0, "fire_alerts": 0, "intrusions": 0,
-    "fall_alerts": 0, "accident_alerts": 0,
+    "fps":             0,
+    "latency_ms":      0,
+    "person_count":    0,
+    "crowd_alerts":    0,
+    "fire_alerts":     0,
+    "intrusions":      0,
+    "fall_alerts":     0,
+    "accident_alerts": 0,
 }
 
 model_metrics = {
-    "model":     "YOLOv8m-seg + ByteTrack (Phase 2)",
+    "model":     "YOLOv8 + ByteTrack",
     "accuracy":  0.91,
     "precision": 0.89,
     "recall":    0.87,
@@ -172,11 +149,10 @@ model_metrics = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Utilities ───────────────────────────────────────────────────────────────────
 
 def play_alert_sound():
+    """Three beeps on a daemon thread — never blocks the frame loop."""
     def _beep():
         for _ in range(3):
             winsound.Beep(1000, 400)
@@ -205,84 +181,34 @@ def save_snapshot(event_type):
 
 
 def compute_iou(boxA, boxB):
-    """Bounding box IoU — used only as segmentation trigger, not final check."""
-    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
-    inter = max(0, xB-xA) * max(0, yB-yA)
+    """Compute IoU between two boxes [x1,y1,x2,y2]."""
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
     if inter == 0:
         return 0.0
-    aA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
-    aB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
-    return inter / float(aA + aB - inter)
-
-
-def compute_mask_overlap(mask_a, mask_b):
-    """
-    Pixel-level mask intersection ratio.
-
-    Formula:
-        overlap_pixels / min(pixels_in_A, pixels_in_B)
-
-    Why min() not union:
-        We want to know what fraction of the SMALLER vehicle
-        is physically inside the larger one. A bus and a motorcycle
-        colliding — the motorcycle may be 100% inside the bus mask.
-        Using union would dilute this signal.
-
-    Returns float in [0.0, 1.0]
-    """
-    intersection = cv2.bitwise_and(mask_a, mask_b)
-    overlap_px   = int(np.count_nonzero(intersection))
-    if overlap_px == 0:
-        return 0.0
-    area_a = int(np.count_nonzero(mask_a))
-    area_b = int(np.count_nonzero(mask_b))
-    min_area = min(area_a, area_b)
-    if min_area == 0:
-        return 0.0
-    return overlap_px / min_area
+    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return inter / float(areaA + areaB - inter)
 
 
 def init_vehicle_state():
     return {
-        "centroids":       deque(maxlen=20),
-        "velocities":      deque(maxlen=20),
-        "vel_vectors":     deque(maxlen=10),
-        "headings":        deque(maxlen=15),
-        "heading_dev_cnt": 0,
-        "bbox_ratios":     deque(maxlen=8),
+        "centroids":       deque(maxlen=10),
+        "velocities":      deque(maxlen=10),
+        "headings":        deque(maxlen=10),
+        "bbox_ratios":     deque(maxlen=5),
         "accident_frames": 0,
-        "active_signals":  set(),
         "class_id":        -1,
+        "accident_logged": False,
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FIRE DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def detect_fire_color(frame):
-    hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    mask    = cv2.inRange(hsv, np.array([0, 120, 150]), np.array([35, 255, 255]))
-    mask    = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    boxes   = []
-    for c in cnts:
-        if cv2.contourArea(c) > 800:
-            x, y, w, h = cv2.boundingRect(c)
-            boxes.append((x, y, x+w, y+h))
-    return boxes
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FALL DETECTION
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Fall Detection (Top-Down) ───────────────────────────────────────────────────
 
 def detect_fall(frame):
-    """
-    Top-down optimised. Three conditions + temporal gate.
-    See previous implementation for full docstring.
-    """
     global fall_frame_counter
     h, w   = frame.shape[:2]
     rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -309,13 +235,16 @@ def detect_fall(frame):
         fall_frame_counter = 0
         return False, frame
 
+    # Condition 1 — shoulder spread
     cond1 = (abs(rs[0] - ls[0]) / w) > FALL_SHOULDER_SPREAD_RATIO
 
+    # Condition 2 — vertical compression
     ankle_y = ((la[1]+ra[1])/2 if la and ra else
                la[1] if la else ra[1] if ra else None)
     cond2 = bool(ns and ankle_y and
                  (abs(ankle_y - ns[1]) / h) < FALL_VERTICAL_COMPRESSION)
 
+    # Condition 3 — keypoint ellipse ratio
     visible_pts = [p for p in [
         px(KP_LEFT_SHOULDER), px(KP_RIGHT_SHOULDER),
         px(KP_LEFT_HIP),      px(KP_RIGHT_HIP),
@@ -328,7 +257,7 @@ def detect_fall(frame):
         ys    = [p[1] for p in visible_pts]
         cond3 = ((max(xs)-min(xs)) / (max(ys)-min(ys)+1)) > FALL_SPREAD_RATIO
 
-    all_conditions     = cond1 and cond2 and cond3
+    all_conditions = cond1 and cond2 and cond3
     fall_frame_counter = fall_frame_counter + 1 if all_conditions else 0
     fall_confirmed     = fall_frame_counter >= FALL_CONFIRM_FRAMES
 
@@ -342,280 +271,198 @@ def detect_fall(frame):
         cv2.putText(frame, "FALL DETECTED", (30, 60),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
     elif all_conditions:
-        cv2.putText(frame,
-                    f"Fall? ({fall_frame_counter}/{FALL_CONFIRM_FRAMES})",
+        cv2.putText(frame, f"Fall? ({fall_frame_counter}/{FALL_CONFIRM_FRAMES})",
                     (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
     return fall_confirmed, frame
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — HYBRID ACCIDENT DETECTION
-# Context-triggered instance segmentation + mask-level collision validation
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Accident Detection ───────────────────────────────────────────────────────────
 
-def detect_accidents(frame, vehicle_boxes, person_boxes, masks_by_id):
+def detect_accidents(frame, vehicle_boxes, person_boxes):
     """
-    Phase 2 Hybrid Architecture — two-stage pipeline:
+    vehicle_boxes : list of (track_id, class_id, x1, y1, x2, y2)
+    person_boxes  : list of (track_id, cx, cy)
+    Returns       : (accident_detected: bool, annotated_frame, reason: str)
 
-    ── STAGE 1: Bounding Box Screening (every frame, O(n²) box pairs) ──────────
-    Compute box IoU for all vehicle pairs.
-    If IoU < BOX_IOU_SEG_TRIGGER → skip this pair entirely (fast path).
-    If IoU ≥ BOX_IOU_SEG_TRIGGER → this pair is a CANDIDATE, proceed to Stage 2.
+    Five signals checked per vehicle and across vehicle pairs:
 
-    ── STAGE 2: Pixel Mask Validation (only for candidates) ────────────────────
-    Retrieve pixel masks for both vehicles from masks_by_id.
-    Compute mask intersection ratio using compute_mask_overlap().
+      Signal 1 — IoU Overlap
+        Any two vehicle bounding boxes overlap beyond COLLISION_IOU_THRESHOLD.
+        Both vehicles flagged. Covers car-car and bike-car collisions.
 
-    If mask_overlap < MASK_OVERLAP_THRESHOLD:
-        → Boxes overlapped but bodies did NOT touch
-        → FALSE POSITIVE eliminated
-        → seg_metrics["fp_eliminated"] += 1
+      Signal 2 — Sudden Velocity Drop
+        Vehicle was moving (avg velocity > MIN_MOVING_VELOCITY) but current
+        velocity < STOPPED_VELOCITY. Indicates post-impact abrupt stoppage.
 
-    If mask_overlap ≥ MASK_OVERLAP_THRESHOLD:
-        → Pixel-level contact confirmed
-        → MASK_COLLISION signal fires
-        → seg_metrics["mask_collisions"] += 1
+      Signal 3 — Trajectory Deviation
+        Heading angle between consecutive centroid vectors changes by more
+        than HEADING_CHANGE_THRESHOLD degrees. Covers swerving / off-road.
 
-    ── SIGNAL COMBINATION ───────────────────────────────────────────────────────
-    MASK_COLLISION  = Signal 1 (replaces old box IoU signal)
-    VELOCITY_DROP   = Signal 2 (unchanged)
-    TRAJECTORY_DEV  = Signal 3 (unchanged)
-    PEDESTRIAN_HIT  = Signal 4 (unchanged)
-    BBOX_DEFORM     = Signal 5 (unchanged)
+      Signal 4 — Person inside Vehicle Box
+        Person centroid falls within a padded vehicle bounding box.
+        Indicates pedestrian impact. Triggers only if vehicle was moving.
 
-    MIN_SIGNALS_REQUIRED = 2 → at least MASK_COLLISION + one more signal.
-    ACCIDENT_CONFIRM_FRAMES = 4 → must hold for 4 consecutive frames.
+      Signal 5 — Bounding Box Ratio Deformation
+        Vehicle W:H ratio changes sharply between frames.
+        Covers spinning, rolling, or crushed vehicle shapes.
 
-    ── VISUAL FEEDBACK ──────────────────────────────────────────────────────────
-    Cyan mask overlay   → segmentation active on this vehicle
-    Orange box          → signals building (pending confirmation)
-    Red box             → accident confirmed
-    "SEG" label         → mask was used for this detection
+    Each signal increments that vehicle's accident_frames counter.
+    Confirmation requires ACCIDENT_CONFIRM_FRAMES consecutive flagged frames.
     """
     accident_detected = False
     accident_reason   = ""
-    frame_signals     = {}
+    flagged_ids       = set()
 
-    # ── Update per-vehicle state ──────────────────────────────────────────────
+    now = time.time()
+
+    # ── Update vehicle state from current detections ──────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
         if tid not in vehicle_states:
             vehicle_states[tid] = init_vehicle_state()
-        vs = vehicle_states[tid]
+
+        vs  = vehicle_states[tid]
+        cx  = (x1 + x2) // 2
+        cy  = (y1 + y2) // 2
         vs["class_id"] = cls_id
-        cx, cy = (x1+x2)//2, (y1+y2)//2
+
+        # Centroid history → velocity
         vs["centroids"].append((cx, cy))
-
         if len(vs["centroids"]) >= 2:
-            prev   = vs["centroids"][-2]
-            vx, vy = cx-prev[0], cy-prev[1]
-            vs["velocities"].append(np.hypot(vx, vy))
-            vs["vel_vectors"].append((vx, vy))
-            vs["headings"].append(np.degrees(np.arctan2(vy, vx)))
+            prev = vs["centroids"][-2]
+            dist = np.hypot(cx - prev[0], cy - prev[1])
+            vs["velocities"].append(dist)
 
-        vs["bbox_ratios"].append(max(x2-x1, 1) / max(y2-y1, 1))
-        frame_signals[tid] = set()
+            # Heading angle (degrees)
+            angle = np.degrees(np.arctan2(cy - prev[1], cx - prev[0]))
+            vs["headings"].append(angle)
 
-    # ── STAGE 1 + 2: Box IoU trigger → Mask validation ───────────────────────
+        # Bounding box aspect ratio history
+        w_box = max(x2 - x1, 1)
+        h_box = max(y2 - y1, 1)
+        vs["bbox_ratios"].append(w_box / h_box)
+
+    # ── Signal 1: IoU Overlap between vehicle pairs ───────────────────────────
     for i in range(len(vehicle_boxes)):
-        for j in range(i+1, len(vehicle_boxes)):
-            tid_a, cls_a, *box_a = vehicle_boxes[i]
-            tid_b, cls_b, *box_b = vehicle_boxes[j]
+        for j in range(i + 1, len(vehicle_boxes)):
+            tid_a, _, *box_a = vehicle_boxes[i]
+            tid_b, _, *box_b = vehicle_boxes[j]
+            iou = compute_iou(box_a, box_b)
+            if iou > COLLISION_IOU_THRESHOLD:
+                flagged_ids.add(tid_a)
+                flagged_ids.add(tid_b)
+                lbl_a = VEHICLE_LABELS.get(vehicle_boxes[i][1], "VEHICLE")
+                lbl_b = VEHICLE_LABELS.get(vehicle_boxes[j][1], "VEHICLE")
+                accident_reason = f"{lbl_a} vs {lbl_b} collision (IoU {iou:.2f})"
 
-            box_iou = compute_iou(box_a, box_b)
-
-            # Fast path — boxes not close enough, skip entirely
-            if box_iou < BOX_IOU_SEG_TRIGGER:
-                continue
-
-            # Box IoU triggered — attempt mask-level validation
-            seg_metrics["seg_triggers"] += 1
-
-            mask_a = masks_by_id.get(tid_a)
-            mask_b = masks_by_id.get(tid_b)
-
-            la = VEHICLE_LABELS.get(cls_a, "VEHICLE")
-            lb = VEHICLE_LABELS.get(cls_b, "VEHICLE")
-
-            if mask_a is not None and mask_b is not None:
-                # Stage 2 — pixel mask intersection
-                overlap_ratio = compute_mask_overlap(mask_a, mask_b)
-
-                if overlap_ratio >= MASK_OVERLAP_THRESHOLD:
-                    # Pixel contact confirmed → MASK_COLLISION signal
-                    seg_metrics["mask_collisions"] += 1
-                    for tid in (tid_a, tid_b):
-                        frame_signals.setdefault(tid, set()).add("MASK_COLLISION")
-                    accident_reason = accident_reason or (
-                        f"{la} vs {lb} pixel collision "
-                        f"(mask_overlap={overlap_ratio:.2f} "
-                        f"box_iou={box_iou:.2f})"
-                    )
-                else:
-                    # Boxes overlapped but masks didn't → FP eliminated
-                    seg_metrics["fp_eliminated"] += 1
-
-            else:
-                # Masks unavailable — fall back to converging velocity check
-                # This handles frames where segmentation output is incomplete
-                vs_a = vehicle_states.get(tid_a)
-                vs_b = vehicle_states.get(tid_b)
-                if (vs_a and vs_b and
-                        vs_a["vel_vectors"] and vs_b["vel_vectors"]):
-                    ca = vs_a["centroids"][-1]
-                    cb = vs_b["centroids"][-1]
-                    dx, dy = cb[0]-ca[0], cb[1]-ca[1]
-                    dist   = np.hypot(dx, dy) + 1e-6
-                    dx_n, dy_n = dx/dist, dy/dist
-                    vxa, vya = vs_a["vel_vectors"][-1]
-                    vxb, vyb = vs_b["vel_vectors"][-1]
-                    converging = (vxa*dx_n + vya*dy_n) + (-vxb*dx_n - vyb*dy_n)
-                    if converging > 1.0:
-                        for tid in (tid_a, tid_b):
-                            frame_signals.setdefault(tid, set()).add("MASK_COLLISION")
-                        accident_reason = accident_reason or (
-                            f"{la} vs {lb} collision (fallback, "
-                            f"approach={converging:.1f}px/f)"
-                        )
-
-    # ── Signal 2: Robust velocity drop ───────────────────────────────────────
+    # ── Signals 2, 3, 5: Per-vehicle history checks ───────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
-        vs    = vehicle_states.get(tid)
-        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        if not vs or len(vs["velocities"]) < VELOCITY_BASELINE_FRAMES:
-            continue
-        vel_list = list(vs["velocities"])
-        baseline = vel_list[:-3]
-        curr_vel = np.mean(vel_list[-3:])
-        avg_base = np.mean(baseline)
-        std_base = np.std(baseline)
-        if (avg_base > MIN_MOVING_VELOCITY and
-                std_base < VELOCITY_BASELINE_MAX_STD and
-                curr_vel < avg_base * VELOCITY_DROP_RATIO):
-            frame_signals.setdefault(tid, set()).add("VELOCITY_DROP")
-            accident_reason = accident_reason or (
-                f"{label} abrupt stop "
-                f"(base={avg_base:.1f}→curr={curr_vel:.1f}px/f)"
-            )
-
-    # ── Signal 3: Sustained heading deviation ────────────────────────────────
-    for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
-        vs    = vehicle_states.get(tid)
-        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        if not vs or len(vs["headings"]) < 3:
-            continue
-        diff = abs(vs["headings"][-1] - vs["headings"][-2])
-        diff = min(diff, 360 - diff)
-        if diff > HEADING_CHANGE_THRESHOLD:
-            vs["heading_dev_cnt"] += 1
-        else:
-            vs["heading_dev_cnt"] = 0
-        if vs["heading_dev_cnt"] >= HEADING_SUSTAINED_FRAMES:
-            frame_signals.setdefault(tid, set()).add("TRAJECTORY_DEV")
-            accident_reason = accident_reason or (
-                f"{label} trajectory deviation ({diff:.0f}°)"
-            )
-
-    # ── Signal 4: Person-vehicle impact ──────────────────────────────────────
-    for ptid, pcx, pcy in person_boxes:
-        ps = person_states.setdefault(ptid, {"entry_time": None, "loiter_logged": False})
-        if "p_centroids" not in ps:
-            ps["p_centroids"]  = deque(maxlen=10)
-            ps["p_velocities"] = deque(maxlen=10)
-        ps["p_centroids"].append((pcx, pcy))
-        if len(ps["p_centroids"]) >= 2:
-            prev = ps["p_centroids"][-2]
-            ps["p_velocities"].append(np.hypot(pcx-prev[0], pcy-prev[1]))
-
-    for (tid, cls_id, vx1, vy1, vx2, vy2) in vehicle_boxes:
-        vs    = vehicle_states.get(tid)
-        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        if not vs or len(vs["velocities"]) < 3:
-            continue
-        if np.mean(list(vs["velocities"])[-3:]) < MIN_MOVING_VELOCITY:
-            continue
-        pad = PERSON_VEHICLE_OVERLAP_PAD
-        for ptid, pcx, pcy in person_boxes:
-            if not ((vx1-pad) <= pcx <= (vx2+pad) and
-                    (vy1-pad) <= pcy <= (vy2+pad)):
-                continue
-            ps = person_states.get(ptid, {})
-            pv = list(ps.get("p_velocities", []))
-            if len(pv) >= 4:
-                if (np.mean(pv[-2:]) / (np.mean(pv[-4:-2])+1e-6)) < PERSON_DECEL_RATIO:
-                    frame_signals.setdefault(tid, set()).add("PEDESTRIAN_HIT")
-                    accident_reason = accident_reason or (
-                        f"Pedestrian impact by {label}"
-                    )
-
-    # ── Signal 5: Median-smoothed bbox deformation ───────────────────────────
-    for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
-        vs    = vehicle_states.get(tid)
-        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        if not vs or len(vs["bbox_ratios"]) < 6:
-            continue
-        ratios = list(vs["bbox_ratios"])
-        if abs(np.median(ratios[-3:]) - np.median(ratios[-6:-3])) > BBOX_RATIO_CHANGE:
-            frame_signals.setdefault(tid, set()).add("BBOX_DEFORM")
-            accident_reason = accident_reason or f"{label} shape deformation"
-
-    # ── Multi-signal temporal gate ────────────────────────────────────────────
-    confirmed_ids = set()
-    flagged_ids   = set()
-
-    for (tid, *_) in vehicle_boxes:
         vs = vehicle_states.get(tid)
         if vs is None:
             continue
-        sigs = frame_signals.get(tid, set())
-        if len(sigs) >= MIN_SIGNALS_REQUIRED:
-            vs["active_signals"] |= sigs
+
+        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+
+        # Signal 2 — Sudden velocity drop
+        if len(vs["velocities"]) >= 5:
+            avg_vel  = np.mean(list(vs["velocities"])[:-1])
+            curr_vel = vs["velocities"][-1]
+            if avg_vel > MIN_MOVING_VELOCITY and curr_vel < STOPPED_VELOCITY:
+                flagged_ids.add(tid)
+                accident_reason = accident_reason or f"{label} sudden stop after impact"
+
+        # Signal 3 — Trajectory / heading deviation
+        if len(vs["headings"]) >= 3:
+            h_list      = list(vs["headings"])
+            heading_diff = abs(h_list[-1] - h_list[-2])
+            # Normalise angle difference to [0, 180]
+            heading_diff = min(heading_diff, 360 - heading_diff)
+            if heading_diff > HEADING_CHANGE_THRESHOLD:
+                flagged_ids.add(tid)
+                accident_reason = accident_reason or f"{label} trajectory deviation ({heading_diff:.0f}°)"
+
+        # Signal 5 — Bounding box deformation
+        if len(vs["bbox_ratios"]) >= 3:
+            ratios = list(vs["bbox_ratios"])
+            if abs(ratios[-1] - ratios[-2]) > BBOX_RATIO_CHANGE:
+                flagged_ids.add(tid)
+                accident_reason = accident_reason or f"{label} shape deformation detected"
+
+    # ── Signal 4: Person inside vehicle bounding box ─────────────────────────
+    for (vtid, cls_id, vx1, vy1, vx2, vy2) in vehicle_boxes:
+        vs    = vehicle_states.get(vtid)
+        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+        # Only flag if vehicle was moving
+        moving = (vs and len(vs["velocities"]) >= 3 and
+                  np.mean(list(vs["velocities"])[-3:]) > MIN_MOVING_VELOCITY)
+        if not moving:
+            continue
+        pad = PERSON_VEHICLE_OVERLAP_PAD
+        for (ptid, pcx, pcy) in person_boxes:
+            if (vx1 - pad) <= pcx <= (vx2 + pad) and (vy1 - pad) <= pcy <= (vy2 + pad):
+                flagged_ids.add(vtid)
+                accident_reason = accident_reason or f"Pedestrian impact by {label}"
+
+    # ── Temporal gate — increment / reset per-vehicle counters ───────────────
+    confirmed_ids = set()
+    for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
+        vs = vehicle_states.get(tid)
+        if vs is None:
+            continue
+        if tid in flagged_ids:
             vs["accident_frames"] += 1
-            flagged_ids.add(tid)
         else:
             vs["accident_frames"] = 0
-            vs["active_signals"]  = set()
+
         if vs["accident_frames"] >= ACCIDENT_CONFIRM_FRAMES:
             confirmed_ids.add(tid)
 
-    # ── Annotate frame ────────────────────────────────────────────────────────
+    # ── Annotate confirmed accidents on frame ─────────────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
         vs    = vehicle_states.get(tid)
         label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
 
-        # Draw cyan pixel mask overlay for vehicles with active segmentation
-        if tid in masks_by_id and tid in (flagged_ids | confirmed_ids):
-            mask = masks_by_id[tid]
-            overlay         = frame.copy()
-            overlay[mask > 0] = [255, 255, 0]   # cyan overlay on mask pixels
-            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-
         if tid in confirmed_ids:
+            # Red box + label for confirmed accident vehicle
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(frame, f"ACCIDENT {label} [SEG]",
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (0, 0, 255), 2)
+            cv2.putText(frame, f"ACCIDENT {label}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             accident_detected = True
 
         elif tid in flagged_ids and vs:
-            sigs = "+".join(sorted(vs["active_signals"])) or "?"
+            # Orange box — signals detected, building toward confirmation
+            cnt = vs["accident_frames"]
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 140, 255), 2)
-            cv2.putText(frame,
-                        f"{sigs} ({vs['accident_frames']}/{ACCIDENT_CONFIRM_FRAMES})",
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 140, 255), 2)
+            cv2.putText(frame, f"Alert? ({cnt}/{ACCIDENT_CONFIRM_FRAMES})",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
 
+    # Global ACCIDENT DETECTED banner
     if accident_detected:
-        cv2.putText(frame, "ACCIDENT DETECTED [Phase 2]",
-                    (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
-                    1.2, (0, 0, 255), 3)
+        cv2.putText(frame, "ACCIDENT DETECTED",
+                    (30, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
 
     return accident_detected, frame, accident_reason
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FLASK ROUTES
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Fire Detection ───────────────────────────────────────────────────────────────
+
+def detect_fire_color(frame):
+    hsv    = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask   = cv2.inRange(hsv, np.array([0, 120, 150]), np.array([35, 255, 255]))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes  = []
+    for c in cnts:
+        if cv2.contourArea(c) > 800:
+            x, y, w, h = cv2.boundingRect(c)
+            boxes.append((x, y, x+w, y+h))
+    return boxes
+
+
+# ─── Routes ──────────────────────────────────────────────────────────────────────
 
 @app.route("/set_roi", methods=["POST"])
 def set_roi():
@@ -624,19 +471,19 @@ def set_roi():
     roi_polygon = np.array(pts, np.int32) if len(pts) >= 3 else None
     return jsonify({"status": "ROI updated"})
 
-@app.route("/toggle_crowd",    methods=["POST"])
+@app.route("/toggle_crowd", methods=["POST"])
 def toggle_crowd():
     global crowd_detection_enabled
     crowd_detection_enabled = not crowd_detection_enabled
     return jsonify({"enabled": crowd_detection_enabled})
 
-@app.route("/toggle_fire",     methods=["POST"])
+@app.route("/toggle_fire", methods=["POST"])
 def toggle_fire():
     global fire_detection_enabled
     fire_detection_enabled = not fire_detection_enabled
     return jsonify({"enabled": fire_detection_enabled})
 
-@app.route("/toggle_fall",     methods=["POST"])
+@app.route("/toggle_fall", methods=["POST"])
 def toggle_fall():
     global fall_detection_enabled
     fall_detection_enabled = not fall_detection_enabled
@@ -659,10 +506,8 @@ def export_logs_csv():
     buf = io.BytesIO()
     buf.write(output.getvalue().encode("utf-8"))
     buf.seek(0)
-    return send_file(
-        buf, mimetype="text/csv", as_attachment=True,
-        download_name=f"safesight_logs_{time.strftime('%Y%m%d_%H%M%S')}.csv"
-    )
+    return send_file(buf, mimetype="text/csv", as_attachment=True,
+                     download_name=f"safesight_logs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
 
 @app.route("/snapshots")
 def list_snapshots():
@@ -672,42 +517,13 @@ def list_snapshots():
         for f in files if f.endswith(".jpg")
     ])
 
-@app.route("/seg_metrics")
-def get_seg_metrics():
-    """
-    Phase 2 segmentation performance metrics.
-    Expose to dashboard to show research contribution live during viva.
-    """
-    return jsonify(seg_metrics)
 
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-@app.route("/video_feed")
-def video_feed():
-    return Response(
-        generate_frames(),
-        mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
-
-@app.route("/events")
-def events():
-    return jsonify(event_logs[::-1])
-
-@app.route("/metrics")
-def live_metrics():
-    return jsonify({"system": metrics, "model": model_metrics})
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FRAME GENERATOR
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Frame Generator ──────────────────────────────────────────────────────────────
 
 def generate_frames():
     global last_intrusion_time, last_crowd_log_time
-    global last_fire_log_time,  last_fall_log_time
-    global last_accident_time,  latest_frame
+    global last_fire_log_time, last_fall_log_time
+    global last_accident_time, latest_frame
     prev_time = time.time()
 
     while True:
@@ -720,27 +536,28 @@ def generate_frames():
         results       = detector.detect(frame)
         tracked_ids   = set()
         fire_detected = False
-        vehicle_boxes = []
-        person_boxes  = []
-        masks_by_id   = {}   # Phase 2 — populated from segmentation results
+
+        # Collected this frame for accident detection
+        vehicle_boxes = []   # (track_id, class_id, x1, y1, x2, y2)
+        person_boxes  = []   # (track_id, cx, cy)
 
         for result in results:
             frame = result.plot(conf=False)
+
             if roi_polygon is not None:
                 cv2.polylines(frame, [roi_polygon], True, (255, 0, 0), 2)
-
-            # Phase 2 — extract pixel masks for all tracked objects this frame
-            frame_masks = YOLODetector.extract_masks(result, frame.shape)
-            masks_by_id.update(frame_masks)
 
             for box in result.boxes:
                 if box.id is None:
                     continue
+
                 cls_id   = int(box.cls[0])
                 track_id = int(box.id.item())
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cx, cy = (x1+x2)//2, (y1+y2)//2
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
 
+                # ── Person logic ──────────────────────────────────────────────
                 if cls_id == 0:
                     tracked_ids.add(track_id)
                     person_boxes.append((track_id, cx, cy))
@@ -767,6 +584,7 @@ def generate_frames():
                                 metrics["intrusions"] += 1
                                 last_intrusion_time = now
                                 save_snapshot("INTRUSION")
+
                         dwell = now - state["entry_time"]
                         if dwell > LOITERING_TIME_THRESHOLD and not state["loiter_logged"]:
                             event_logs.append({
@@ -775,12 +593,14 @@ def generate_frames():
                                 "details": f"Person ID {track_id} loitering ({int(dwell)}s)",
                             })
                             state["loiter_logged"] = True
+
                         cv2.putText(frame, "INTRUSION", (x1, y1-10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                     else:
                         state["entry_time"]    = None
                         state["loiter_logged"] = False
 
+                # ── Vehicle collection for accident detection ─────────────────
                 elif cls_id in VEHICLE_CLASSES:
                     vehicle_boxes.append((track_id, cls_id, x1, y1, x2, y2))
 
@@ -819,10 +639,10 @@ def generate_frames():
                 save_snapshot("FALL")
                 play_alert_sound()
 
-        # ── Accident (Phase 2 — passes masks_by_id) ───────────────────────────
+        # ── Accident ──────────────────────────────────────────────────────────
         if accident_detection_enabled and vehicle_boxes:
             acc_detected, frame, acc_reason = detect_accidents(
-                frame, vehicle_boxes, person_boxes, masks_by_id
+                frame, vehicle_boxes, person_boxes
             )
             if acc_detected and time.time() - last_accident_time > ACCIDENT_LOG_COOLDOWN:
                 event_logs.append({
@@ -849,7 +669,24 @@ def generate_frames():
                b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── Core Routes ──────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_frames(),
+                    mimetype="multipart/x-mixed-replace; boundary=frame")
+
+@app.route("/events")
+def events():
+    return jsonify(event_logs[::-1])
+
+@app.route("/metrics")
+def live_metrics():
+    return jsonify({"system": metrics, "model": model_metrics})
 
 if __name__ == "__main__":
     app.run(debug=True)

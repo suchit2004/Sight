@@ -8,7 +8,7 @@ class YOLODetector:
         # Same architecture, same CUDA pipeline, same ultralytics API
         # Adds per-instance pixel masks with zero extra dependencies
         # Model auto-downloads on first run (~52MB)
-        self.model = YOLO("yolov8m-seg.pt")
+        self.model = YOLO("yolov8m.pt")
 
     def detect(self, frame):
         """

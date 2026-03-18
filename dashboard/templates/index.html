@@ -50,6 +50,7 @@
             margin-bottom: 20px;
             display: flex;
             justify-content: space-between;
+            align-items: center;
         }
 
         .status {
@@ -69,9 +70,6 @@
             border-radius: 10px;
         }
 
-        .fire {
-            background: #ef4444;
-        }
         .card h3 {
             margin-top: 0;
             color: #38bdf8;
@@ -83,17 +81,34 @@
             margin-bottom: 8px;
             border: none;
             border-radius: 6px;
-            background: #1e293b;
-            color: #94a3b8;
             cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: background 0.2s, color 0.2s;
         }
 
+        /* Blue — static action buttons */
         .controls button.primary {
             background: #2563eb;
             color: white;
         }
 
+        /* Green — toggle is ON */
+        .controls button.on {
+            background: #16a34a;
+            color: white;
+        }
+
+        /* Red — toggle is OFF */
+        .controls button.off {
+            background: #dc2626;
+            color: white;
+        }
+
+        /* Grey — coming soon / disabled */
         .controls button.disabled {
+            background: #1e293b;
+            color: #94a3b8;
             cursor: not-allowed;
             opacity: 0.5;
         }
@@ -107,17 +122,24 @@
         .event-log p {
             border-bottom: 1px solid #1e293b;
             padding-bottom: 6px;
+            margin: 6px 0;
         }
 
         .badge {
-            padding: 2px 6px;
+            padding: 2px 8px;
             border-radius: 4px;
             font-size: 12px;
+            font-weight: bold;
+            margin-right: 6px;
         }
 
-        .intrusion { background: #dc2626; }
-        .fall { background: #f59e0b; }
-        .loitering { background: #a855f7; }
+        .intrusion  { background: #dc2626; }
+        .loitering  { background: #a855f7; }
+        .fall       { background: #f59e0b; color: #000; }
+        .crowd      { background: #0ea5e9; }
+        .fire       { background: #f97316; }
+        .accident   { background: #ef4444; }
+        .snapshot   { background: #6b7280; }
 
         canvas {
             position: absolute;
@@ -134,8 +156,8 @@
     <a href="#">Live Monitor</a>
     <a href="#">Event Logs</a>
     <a href="#">ROI Management</a>
-    <a href="#">Crowd Analytics (Soon)</a>
-    <a href="#">Fire Detection (Soon)</a>
+    <a href="#">Crowd Analytics</a>
+    <a href="#">Fire Detection</a>
     <a href="#">Face Recognition (Soon)</a>
     <a href="#">System Health</a>
     <a href="#">Settings</a>
@@ -150,9 +172,7 @@
             Edge Mode: ACTIVE |
             Camera: CCTV-1
         </div>
-        <div>
-            FPS: ~12 | Latency: ~180ms
-        </div>
+        <div id="live-stats">FPS: -- | Latency: --ms | Persons: --</div>
     </div>
 
     <div class="grid">
@@ -160,7 +180,6 @@
         <!-- ============ VIDEO CARD ============ -->
         <div class="card">
             <h3>Live CCTV Feed</h3>
-
             <div style="position: relative;">
                 <img id="video" src="/video_feed" width="100%">
                 <canvas id="roiCanvas"></canvas>
@@ -172,27 +191,30 @@
             <h3>System Controls</h3>
 
             <button class="primary" onclick="startROIMode()">Add Restricted Zone</button>
-
             <button class="primary" onclick="saveROI()">Save ROI</button>
 
-            <button class="primary" onclick="toggleCrowd()">Enable / Disable Crowd Detection</button>
+            <button id="btn-crowd"    class="off" onclick="toggle('crowd')">
+                Crowd Detection: OFF
+            </button>
 
-            <button class="primary" onclick="toggleFire()">Enable Fire Detection</button>
+            <button id="btn-fire"     class="off" onclick="toggle('fire')">
+                Fire Detection: OFF
+            </button>
 
-            <button class="primary" onclick="toggleFall()">Enable Fall Detection</button>
+            <button id="btn-fall"     class="off" onclick="toggle('fall')">
+                Fall Detection: OFF
+            </button>
 
-            <button class="disabled">Face Recognition</button>
-            
+            <button id="btn-accident" class="off" onclick="toggle('accident')">
+                Accident Detection: OFF
+            </button>
+
+            <button id="btn-face" class="off" onclick="toggle('face')">
+                Face Recognition: OFF
+            </button>
+
             <button class="primary" onclick="viewSnapshots()">View Snapshots</button>
-            
             <button class="primary" onclick="exportLogs()">Export Logs</button>
-
-            <button class="primary" onclick="toggleAccident()">Enable Accident Detection</button>
-            
-            <button onclick="fetch('/toggle_segmentation', {method:'POST'})"> Toggle Segmentation</button>
-            
-            <button onclick="fetch('/toggle_face', {method:'POST'})">Toggle Face Recognition</button>
-
         </div>
     </div>
 
@@ -201,8 +223,30 @@
     <!-- ============ EVENT LOG ============ -->
     <div class="card">
         <h3>Real-Time Event Logs</h3>
-        <div id="event-log" class="event-log">
-            No events yet.
+        <div id="event-log" class="event-log">No events yet.</div>
+    </div>
+
+    <br>
+
+    <!-- ============ FACE AUTH MANAGEMENT ============ -->
+    <div class="card">
+        <h3>Authorized Faces</h3>
+        <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start;">
+            <div style="min-width:280px;">
+                <div style="margin-bottom:8px; color:#94a3b8; font-size:13px;">
+                    Upload a clear face image. In strict mode, if face is not visible in ROI, user is treated as unauthorized.
+                </div>
+                <input id="face-name" type="text" placeholder="Name (e.g., Suchit)"
+                       style="width:100%; padding:10px; border-radius:6px; border:1px solid #1e293b; background:#0b1220; color:#e5e7eb; margin-bottom:8px;">
+                <input id="face-file" type="file" accept="image/*"
+                       style="width:100%; margin-bottom:8px;">
+                <button class="primary" style="width:100%;" onclick="enrollFace()">Enroll / Update</button>
+            </div>
+
+            <div style="flex:1; min-width:280px;">
+                <div id="faces-status" style="margin-bottom:8px; color:#94a3b8; font-size:13px;">Loading...</div>
+                <div id="faces-list" class="event-log" style="max-height:200px;">No authorized users.</div>
+            </div>
         </div>
     </div>
 
@@ -211,39 +255,37 @@
 <!-- ================= JS ================= -->
 <script>
 const canvas = document.getElementById("roiCanvas");
-const ctx = canvas.getContext("2d");
-const video = document.getElementById("video");
+const ctx    = canvas.getContext("2d");
+const video  = document.getElementById("video");
 
 let drawing = false;
-let points = [];
+let points  = [];
 
 video.onload = () => {
-    canvas.width = video.clientWidth;
+    canvas.width  = video.clientWidth;
     canvas.height = video.clientHeight;
 };
 
+// ── ROI ───────────────────────────────────────────────────────────────────────
 function startROIMode() {
-    points = [];
+    points  = [];
     drawing = true;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
 canvas.addEventListener("click", e => {
     if (!drawing) return;
-
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-
     points.push([x, y]);
-
     ctx.fillStyle = "red";
     ctx.beginPath();
     ctx.arc(x, y, 5, 0, Math.PI * 2);
     ctx.fill();
-
     if (points.length > 1) {
         ctx.strokeStyle = "red";
+        ctx.lineWidth   = 2;
         ctx.beginPath();
         ctx.moveTo(points[points.length-2][0], points[points.length-2][1]);
         ctx.lineTo(x, y);
@@ -251,22 +293,39 @@ canvas.addEventListener("click", e => {
     }
 });
 
-function toggleAccident() {
-    fetch("/toggle_accident", { method: "POST" })
-        .then(res => res.json())
-        .then(data => console.log("Accident detection:", data.enabled));
-}
-
 function saveROI() {
     drawing = false;
-
     fetch("/set_roi", {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ points })
-    });
+        body:    JSON.stringify({ points })
+    }).then(() => alert("ROI saved."));
 }
 
+// ── Toggle buttons ────────────────────────────────────────────────────────────
+// Each toggle calls its route then updates the button directly from the response.
+// No /status route needed — each route already returns {"enabled": bool}.
+const TOGGLE_LABELS = {
+    crowd:    "Crowd Detection",
+    fire:     "Fire Detection",
+    fall:     "Fall Detection",
+    accident: "Accident Detection",
+    face:     "Face Recognition",
+};
+
+function toggle(feature) {
+    fetch(`/toggle_${feature}`, { method: "POST" })
+        .then(res => res.json())
+        .then(data => {
+            const btn   = document.getElementById(`btn-${feature}`);
+            const label = TOGGLE_LABELS[feature];
+            const isOn  = data.enabled;
+            btn.textContent = `${label}: ${isOn ? "ON" : "OFF"}`;
+            btn.className   = isOn ? "on" : "off";
+        });
+}
+
+// ── Snapshots & Export ────────────────────────────────────────────────────────
 function viewSnapshots() {
     fetch("/snapshots")
         .then(res => res.json())
@@ -276,37 +335,79 @@ function viewSnapshots() {
         });
 }
 
-function toggleFall() {
-    fetch("/toggle_fall", { method: "POST" })
-        .then(res => res.json())
-        .then(data => console.log("Fall detection:", data.enabled));
-}
-
 function exportLogs() {
     window.open("/export_logs_csv", "_blank");
 }
 
-function toggleCrowd() {
-    fetch("/toggle_crowd", { method: "POST" })
+// ── Face management ───────────────────────────────────────────────────────────
+function refreshFaces() {
+    fetch("/faces")
         .then(res => res.json())
         .then(data => {
-            alert(
-                data.enabled
-                ? "Crowd Detection ENABLED"
-                : "Crowd Detection DISABLED"
-            );
-        });
+            const users = data.users || [];
+            const trained = !!data.trained;
+            document.getElementById("faces-status").textContent =
+                `Model: ${trained ? "TRAINED" : "NOT TRAINED"} | Users: ${users.length}`;
+
+            const list = document.getElementById("faces-list");
+            if (users.length === 0) {
+                list.innerHTML = "No authorized users.";
+                return;
+            }
+            list.innerHTML = users.map(u => {
+                return `<p style="display:flex; justify-content:space-between; gap:10px; align-items:center;">
+                    <span>${u}</span>
+                    <button class="off" style="padding:6px 10px; font-size:12px; width:auto;"
+                            onclick="deleteFace('${u.replace(/'/g, "\\'")}')">Remove</button>
+                </p>`;
+            }).join("");
+        })
+        .catch(() => {});
 }
 
-
-function toggleFire() {
-    fetch("/toggle_fire", { method: "POST" })
+function enrollFace() {
+    const name = document.getElementById("face-name").value.trim();
+    const file = document.getElementById("face-file").files[0];
+    if (!name || !file) { alert("Please provide name and image."); return; }
+    const fd = new FormData();
+    fd.append("name", name);
+    fd.append("image", file);
+    fetch("/enroll_face", { method: "POST", body: fd })
         .then(res => res.json())
         .then(data => {
-            alert("Fire Detection: " + (data.enabled ? "ON" : "OFF"));
-        });
+            if (data.error) { alert(data.error); return; }
+            document.getElementById("face-file").value = "";
+            refreshFaces();
+            alert("Enrolled.");
+        })
+        .catch(() => alert("Enroll failed."));
 }
-// ---------------- EVENT LOG UPDATE ----------------
+
+function deleteFace(name) {
+    if (!confirm(`Remove ${name}?`)) return;
+    fetch("/delete_face", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name })
+    })
+        .then(res => res.json())
+        .then(() => refreshFaces())
+        .catch(() => {});
+}
+
+// ── Live metrics ──────────────────────────────────────────────────────────────
+setInterval(() => {
+    fetch("/metrics")
+        .then(res => res.json())
+        .then(data => {
+            const s = data.system;
+            document.getElementById("live-stats").textContent =
+                `FPS: ${s.fps} | Latency: ${s.latency_ms}ms | Persons: ${s.person_count}`;
+        })
+        .catch(() => {});
+}, 1000);
+
+// ── Event log ─────────────────────────────────────────────────────────────────
 setInterval(() => {
     fetch("/events")
         .then(res => res.json())
@@ -316,17 +417,19 @@ setInterval(() => {
                 log.innerHTML = "No events detected yet.";
                 return;
             }
-
             log.innerHTML = data.map(e => {
-                let cls = e.type.toLowerCase();
-                return `
-                    <p>
-                        <span class="badge ${cls}">${e.type}</span>
-                        ${e.time} - ${e.details}
-                    </p>`;
+                const cls = e.type.toLowerCase().replace(/_/g, "-");
+                return `<p>
+                    <span class="badge ${cls}">${e.type}</span>
+                    ${e.time} — ${e.details}
+                </p>`;
             }).join("");
-        });
+        })
+        .catch(() => {});
 }, 2000);
+
+// initial load
+refreshFaces();
 </script>
 
 </body>

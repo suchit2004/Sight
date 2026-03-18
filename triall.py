@@ -18,7 +18,6 @@ PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
 sys.path.append(PROJECT_ROOT)
 
 from detection.yolo_detector import YOLODetector
-from dashboard.face_auth import FaceAuthLBPH
 
 app = Flask(__name__)
 
@@ -27,90 +26,69 @@ person_states  = {}
 vehicle_states = {}
 event_logs     = []
 
-# ─── Cooldown timestamps ──────────────────────────────────────────────────────
+# ─── Cooldowns ────────────────────────────────────────────────────────────────
 last_intrusion_time = 0
 last_crowd_log_time = 0
 last_fire_log_time  = 0
 last_fall_log_time  = 0
 last_accident_time  = 0
 
-# ─── Feature constants ────────────────────────────────────────────────────────
+# ─── Person / Intrusion ───────────────────────────────────────────────────────
 INTRUSION_COOLDOWN       = 5
 LOITERING_TIME_THRESHOLD = 10
 
+# ─── Crowd ────────────────────────────────────────────────────────────────────
 CROWD_THRESHOLD         = 5
 CROWD_COOLDOWN          = 10
 crowd_detection_enabled = False
 
+# ─── Fire ─────────────────────────────────────────────────────────────────────
 fire_detection_enabled = False
 FIRE_LOG_COOLDOWN      = 10
 
-fall_detection_enabled = False
-FALL_LOG_COOLDOWN      = 10
-
-# ─── Face recognition ──────────────────────────────────────────────────────────
-face_recognition_enabled = False
-FACE_CHECK_INTERVAL_SEC  = 1.5   # per track_id
-FACE_MATCH_THRESHOLD     = 80  # LBPH: lower is better
-
-FACES_DIR   = os.path.abspath(os.path.join(PROJECT_ROOT, "faces_db"))
-FACE_MODEL  = os.path.join(BASE_DIR, "face_model.yml")
-FACE_LABELS = os.path.join(BASE_DIR, "face_labels.json")
-
-os.makedirs(FACES_DIR, exist_ok=True)
-face_auth = FaceAuthLBPH(
-    faces_dir=FACES_DIR,
-    model_path=FACE_MODEL,
-    labels_path=FACE_LABELS,
-)
-# Train once at startup (best-effort). If dataset is small/empty, it stays untrained.
-try:
-    face_auth.retrain()
-except Exception:
-    pass
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FALL DETECTION THRESHOLDS
-# Calibrated from video analysis of side-view CCTV footage:
-#   Standing person YOLO box W:H ≈ 0.45–0.55  (tall narrow)
-#   Fallen  person YOLO box W:H ≈ 1.4–1.7     (wide flat)
-#
-# Two-signal approach:
-#   Signal 1 — YOLO box aspect ratio > threshold (camera-angle independent)
-#   Signal 2 — MediaPipe spine angle (when landmarks visible, side-view)
-#
-# Either signal alone can trigger — OR both must fire (configurable below).
-# Temporal gate prevents single-frame false positives.
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Signal 1 — YOLO bounding box W:H ratio
-# Standing: ~0.5  |  Fallen: ~1.5
-# Threshold set conservatively at 1.0 (safe gap between 0.5 and 1.5)
-FALL_BBOX_RATIO_THRESHOLD  = 1.0
-
-# Signal 2 — MediaPipe spine angle from horizontal (degrees)
-# Standing spine is ~70-90° from horizontal
-# Fallen  spine is ~0-30° from horizontal
-# Threshold: if spine angle < 40° → body is mostly horizontal → fallen
-FALL_SPINE_ANGLE_THRESHOLD = 40.0
-
-# Temporal gate — N consecutive frames before confirming
+# ─── Fall ─────────────────────────────────────────────────────────────────────
+fall_detection_enabled     = False
+FALL_LOG_COOLDOWN          = 10
+FALL_SHOULDER_SPREAD_RATIO = 0.15
+FALL_VERTICAL_COMPRESSION  = 0.18
+FALL_SPREAD_RATIO          = 1.4
 FALL_CONFIRM_FRAMES        = 4
-
-# Visibility threshold for MediaPipe keypoints
-MIN_KEYPOINT_VISIBILITY    = 0.35
+MIN_KEYPOINT_VISIBILITY    = 0.4
 
 # ─── Accident ─────────────────────────────────────────────────────────────────
-accident_detection_enabled = False
-ACCIDENT_LOG_COOLDOWN      = 15
-COLLISION_IOU_THRESHOLD    = 0.15
-MIN_MOVING_VELOCITY        = 3.0
-STOPPED_VELOCITY           = 1.0
-HEADING_CHANGE_THRESHOLD   = 45.0
-PERSON_VEHICLE_OVERLAP_PAD = 20
-BBOX_RATIO_CHANGE          = 0.5
-ACCIDENT_CONFIRM_FRAMES    = 5
+accident_detection_enabled  = False
+ACCIDENT_LOG_COOLDOWN       = 15
 
+# ─── Segmentation toggle ──────────────────────────────────────────────────────
+# Independent of accident_detection_enabled.
+# accident ON  + segmentation OFF → accident uses velocity fallback only
+# accident ON  + segmentation ON  → accident uses pixel mask intersection
+# accident OFF + segmentation ON  → masks never extracted (no vehicle loop runs)
+# Fall detection is NEVER affected by this toggle.
+segmentation_enabled        = False
+
+# ── Accident thresholds ───────────────────────────────────────────────────────
+BOX_IOU_SEG_TRIGGER        = 0.30
+MASK_OVERLAP_THRESHOLD     = 0.15
+VELOCITY_BASELINE_FRAMES   = 8
+MIN_MOVING_VELOCITY        = 3.0
+VELOCITY_DROP_RATIO        = 0.20
+VELOCITY_BASELINE_MAX_STD  = 5.0
+HEADING_CHANGE_THRESHOLD   = 45.0
+HEADING_SUSTAINED_FRAMES   = 2
+PERSON_VEHICLE_OVERLAP_PAD = 20
+PERSON_DECEL_RATIO         = 0.5
+BBOX_RATIO_CHANGE          = 0.5
+MIN_SIGNALS_REQUIRED       = 2
+ACCIDENT_CONFIRM_FRAMES    = 4
+
+seg_metrics = {
+    "seg_triggers":    0,
+    "mask_collisions": 0,
+    "fp_eliminated":   0,
+}
+
+# ─── YOLO vehicle classes ─────────────────────────────────────────────────────
 VEHICLE_CLASSES = {1, 2, 3, 5, 7}
 VEHICLE_LABELS  = {
     1: "BICYCLE", 2: "CAR", 3: "MOTORCYCLE", 5: "BUS", 7: "TRUCK"
@@ -131,15 +109,16 @@ last_snapshot_time = {
     "CROWD":     0, "FALL": 0,
     "ACCIDENT":  0,
 }
-SNAPSHOT_COOLDOWN = 10
+SNAPSHOT_COOLDOWN  = 10
+fall_frame_counter = 0
 
 # ─── MediaPipe Pose ───────────────────────────────────────────────────────────
 pose_model = MediaPipePose(
     static_image_mode=False,
     model_complexity=0,
     enable_segmentation=False,
-    min_detection_confidence=0.4,
-    min_tracking_confidence=0.4,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
 )
 
 KP_NOSE           = 0
@@ -151,8 +130,8 @@ KP_LEFT_ANKLE     = 27
 KP_RIGHT_ANKLE    = 28
 
 # ─── Video ────────────────────────────────────────────────────────────────────
-#cap      = cv2.VideoCapture("../data/CLIP1.mp4")
-cap = cv2.VideoCapture(0)
+cap      = cv2.VideoCapture("../data/CLASS.mp4")
+# cap    = cv2.VideoCapture(0)
 detector = YOLODetector()
 
 # ─── Metrics ──────────────────────────────────────────────────────────────────
@@ -163,16 +142,12 @@ metrics = {
 }
 
 model_metrics = {
-    "model":     "YOLOv8m-seg + ByteTrack",
+    "model":     "YOLOv8m-seg + ByteTrack (Phase 2)",
     "accuracy":  0.91,
     "precision": 0.89,
     "recall":    0.87,
     "f1_score":  0.88,
 }
-
-# Per-person fall state — keyed by YOLO track_id
-# Stores bbox ratio history and frame counter independently per person
-person_fall_states = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -213,190 +188,33 @@ def compute_iou(boxA, boxB):
     inter = max(0, xB-xA) * max(0, yB-yA)
     if inter == 0:
         return 0.0
-    areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
-    areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
-    return inter / float(areaA + areaB - inter)
+    aA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+    aB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+    return inter / float(aA + aB - inter)
+
+
+def compute_mask_overlap(mask_a, mask_b):
+    intersection = cv2.bitwise_and(mask_a, mask_b)
+    overlap_px   = int(np.count_nonzero(intersection))
+    if overlap_px == 0:
+        return 0.0
+    min_area = min(int(np.count_nonzero(mask_a)),
+                   int(np.count_nonzero(mask_b)))
+    return 0.0 if min_area == 0 else overlap_px / min_area
 
 
 def init_vehicle_state():
     return {
-        "centroids":       deque(maxlen=10),
-        "velocities":      deque(maxlen=10),
-        "headings":        deque(maxlen=10),
-        "bbox_ratios":     deque(maxlen=5),
+        "centroids":       deque(maxlen=20),
+        "velocities":      deque(maxlen=20),
+        "vel_vectors":     deque(maxlen=10),
+        "headings":        deque(maxlen=15),
+        "heading_dev_cnt": 0,
+        "bbox_ratios":     deque(maxlen=8),
         "accident_frames": 0,
+        "active_signals":  set(),
         "class_id":        -1,
-        "accident_logged": False,
     }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# FALL DETECTION — DUAL SIGNAL (YOLO BOX + MEDIAPIPE SPINE)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_spine_angle_from_frame(frame, x1, y1, x2, y2):
-    """
-    Run MediaPipe on a cropped person region.
-    Returns spine angle from horizontal in degrees, or None if landmarks
-    not visible enough.
-
-    Spine vector = hip_midpoint → shoulder_midpoint
-    Angle = 0°  → perfectly horizontal (lying flat)
-    Angle = 90° → perfectly vertical   (standing upright)
-
-    For side-view cameras this is the most reliable single signal.
-    """
-    # Add padding to crop so MediaPipe has context
-    pad   = 20
-    H, W  = frame.shape[:2]
-    cx1   = max(0, x1 - pad)
-    cy1   = max(0, y1 - pad)
-    cx2   = min(W, x2 + pad)
-    cy2   = min(H, y2 + pad)
-    crop  = frame[cy1:cy2, cx1:cx2]
-
-    if crop.size == 0:
-        return None
-
-    rgb    = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-    result = pose_model.process(rgb)
-
-    if not result.pose_landmarks:
-        return None
-
-    lm = result.pose_landmarks.landmark
-    ch, cw = crop.shape[:2]
-
-    def kp(idx):
-        k = lm[idx]
-        if k.visibility < MIN_KEYPOINT_VISIBILITY:
-            return None
-        return k.x * cw, k.y * ch
-
-    l_sh  = kp(KP_LEFT_SHOULDER)
-    r_sh  = kp(KP_RIGHT_SHOULDER)
-    l_hip = kp(KP_LEFT_HIP)
-    r_hip = kp(KP_RIGHT_HIP)
-
-    # Need at least one shoulder and one hip
-    sh_pts  = [p for p in [l_sh, r_sh] if p]
-    hip_pts = [p for p in [l_hip, r_hip] if p]
-
-    if not sh_pts or not hip_pts:
-        return None
-
-    sh_mid  = np.mean(sh_pts,  axis=0)
-    hip_mid = np.mean(hip_pts, axis=0)
-
-    dx = sh_mid[0] - hip_mid[0]
-    dy = sh_mid[1] - hip_mid[1]
-
-    # Angle from horizontal: arctan(|dy| / |dx|)
-    # 0° = horizontal spine, 90° = vertical spine
-    angle = abs(np.degrees(np.arctan2(abs(dy), abs(dx) + 1e-6)))
-    return angle
-
-
-def detect_fall_for_person(frame, track_id, x1, y1, x2, y2):
-    """
-    Per-person fall detection using two independent signals:
-
-    Signal 1 — YOLO bounding box aspect ratio (W / H)
-      Works on ANY camera angle — no pose estimation needed.
-      Standing person: box is TALL   → W/H < 0.7
-      Fallen  person: box is WIDE   → W/H > 1.0
-      Camera-angle agnostic because the box always reflects body orientation.
-
-    Signal 2 — MediaPipe spine angle (degrees from horizontal)
-      Best for side-view cameras.
-      Standing: spine is near vertical  → angle ~70-90°
-      Fallen:   spine is near horizontal → angle ~0-30°
-      Falls back gracefully if landmarks not detected.
-
-    Decision logic:
-      - Signal 1 fires  (bbox ratio > threshold)   → candidate
-      - Signal 2 fires  (spine angle < threshold)  → additional confirmation
-      - Either signal alone triggers the frame counter
-      - Both signals together = stronger confidence
-
-    Temporal gate: FALL_CONFIRM_FRAMES consecutive flagged frames required.
-    """
-    if track_id not in person_fall_states:
-        person_fall_states[track_id] = {
-            "fall_frames":  0,
-            "bbox_history": deque(maxlen=6),
-        }
-
-    pfs = person_fall_states[track_id]
-
-    box_w = x2 - x1
-    box_h = max(y2 - y1, 1)
-    ratio = box_w / box_h
-    pfs["bbox_history"].append(ratio)
-
-    # Use median of last few frames to smooth noise
-    smooth_ratio = float(np.median(list(pfs["bbox_history"])))
-
-    # Signal 1 — bbox aspect ratio
-    signal_bbox = smooth_ratio > FALL_BBOX_RATIO_THRESHOLD
-
-    # Signal 2 — MediaPipe spine angle (run only when bbox already suspicious)
-    # This avoids running MediaPipe every frame for every person
-    signal_spine = False
-    spine_angle  = None
-    if signal_bbox:
-        spine_angle  = get_spine_angle_from_frame(frame, x1, y1, x2, y2)
-        signal_spine = (spine_angle is not None and
-                        spine_angle < FALL_SPINE_ANGLE_THRESHOLD)
-
-    # Either signal triggers the counter
-    any_signal = signal_bbox or signal_spine
-
-    if any_signal:
-        pfs["fall_frames"] += 1
-    else:
-        pfs["fall_frames"] = 0
-
-    fall_confirmed = pfs["fall_frames"] >= FALL_CONFIRM_FRAMES
-
-    return fall_confirmed, smooth_ratio, spine_angle, pfs["fall_frames"]
-
-
-def detect_fall(frame, person_detections):
-    """
-    Main fall detection entry point.
-    Called with list of (track_id, x1, y1, x2, y2) for all persons this frame.
-
-    Returns (any_fall_confirmed, annotated_frame)
-    """
-    any_confirmed = False
-
-    for (track_id, x1, y1, x2, y2) in person_detections:
-        confirmed, ratio, spine_angle, counter = detect_fall_for_person(
-            frame, track_id, x1, y1, x2, y2
-        )
-
-        if confirmed:
-            any_confirmed = True
-            # Red box + label
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(frame, "FALL DETECTED",
-                        (x1, y1 - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-            cv2.putText(frame, "FALL DETECTED",
-                        (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
-
-        elif ratio > FALL_BBOX_RATIO_THRESHOLD:
-            # Pending — building toward confirmation
-            spine_str = f" spine={spine_angle:.0f}°" if spine_angle else ""
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 165, 255), 2)
-            cv2.putText(frame,
-                        f"Fall? {counter}/{FALL_CONFIRM_FRAMES} ratio={ratio:.2f}{spine_str}",
-                        (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 165, 255), 2)
-
-    return any_confirmed, frame
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -417,97 +235,279 @@ def detect_fire_color(frame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FALL DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_fall(frame):
+    global fall_frame_counter
+    h, w   = frame.shape[:2]
+    rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    result = pose_model.process(rgb)
+
+    if not result.pose_landmarks:
+        fall_frame_counter = 0
+        return False, frame
+
+    lm = result.pose_landmarks.landmark
+
+    def px(idx):
+        kp = lm[idx]
+        if kp.visibility < MIN_KEYPOINT_VISIBILITY:
+            return None
+        return int(kp.x * w), int(kp.y * h)
+
+    ls, rs = px(KP_LEFT_SHOULDER), px(KP_RIGHT_SHOULDER)
+    lh, rh = px(KP_LEFT_HIP),      px(KP_RIGHT_HIP)
+    la, ra = px(KP_LEFT_ANKLE),     px(KP_RIGHT_ANKLE)
+    ns     = px(KP_NOSE)
+
+    if ls is None or rs is None:
+        fall_frame_counter = 0
+        return False, frame
+
+    cond1 = (abs(rs[0] - ls[0]) / w) > FALL_SHOULDER_SPREAD_RATIO
+
+    ankle_y = ((la[1]+ra[1])/2 if la and ra else
+               la[1] if la else ra[1] if ra else None)
+    cond2 = bool(ns and ankle_y and
+                 (abs(ankle_y - ns[1]) / h) < FALL_VERTICAL_COMPRESSION)
+
+    visible_pts = [p for p in [
+        px(KP_LEFT_SHOULDER), px(KP_RIGHT_SHOULDER),
+        px(KP_LEFT_HIP),      px(KP_RIGHT_HIP),
+        px(KP_LEFT_ANKLE),    px(KP_RIGHT_ANKLE),
+    ] if p is not None]
+
+    cond3 = False
+    if len(visible_pts) >= 4:
+        xs    = [p[0] for p in visible_pts]
+        ys    = [p[1] for p in visible_pts]
+        cond3 = ((max(xs)-min(xs)) / (max(ys)-min(ys)+1)) > FALL_SPREAD_RATIO
+
+    all_conditions     = cond1 and cond2 and cond3
+    fall_frame_counter = fall_frame_counter + 1 if all_conditions else 0
+    fall_confirmed     = fall_frame_counter >= FALL_CONFIRM_FRAMES
+
+    if fall_confirmed:
+        for pt in visible_pts:
+            cv2.circle(frame, pt, 6, (0, 255, 255), -1)
+        if ls and rs: cv2.line(frame, ls, rs, (0, 255, 255), 2)
+        if lh and rh: cv2.line(frame, lh, rh, (0, 255, 255), 2)
+        if ls and lh: cv2.line(frame, ls, lh, (0, 255, 255), 2)
+        if rs and rh: cv2.line(frame, rs, rh, (0, 255, 255), 2)
+        cv2.putText(frame, "FALL DETECTED", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
+    elif all_conditions:
+        cv2.putText(frame,
+                    f"Fall? ({fall_frame_counter}/{FALL_CONFIRM_FRAMES})",
+                    (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+    return fall_confirmed, frame
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ACCIDENT DETECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def detect_accidents(frame, vehicle_boxes, person_boxes):
+def detect_accidents(frame, vehicle_boxes, person_boxes, masks_by_id):
     accident_detected = False
     accident_reason   = ""
-    flagged_ids       = set()
+    frame_signals     = {}
 
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
         if tid not in vehicle_states:
             vehicle_states[tid] = init_vehicle_state()
         vs = vehicle_states[tid]
-        cx, cy = (x1+x2)//2, (y1+y2)//2
         vs["class_id"] = cls_id
+        cx, cy = (x1+x2)//2, (y1+y2)//2
         vs["centroids"].append((cx, cy))
         if len(vs["centroids"]) >= 2:
-            prev = vs["centroids"][-2]
-            dist = np.hypot(cx-prev[0], cy-prev[1])
-            vs["velocities"].append(dist)
-            vs["headings"].append(np.degrees(np.arctan2(cy-prev[1], cx-prev[0])))
+            prev   = vs["centroids"][-2]
+            vx, vy = cx-prev[0], cy-prev[1]
+            vs["velocities"].append(np.hypot(vx, vy))
+            vs["vel_vectors"].append((vx, vy))
+            vs["headings"].append(np.degrees(np.arctan2(vy, vx)))
         vs["bbox_ratios"].append(max(x2-x1, 1) / max(y2-y1, 1))
+        frame_signals[tid] = set()
 
+    # ── Signal 1: Mask collision OR velocity convergence ─────────────────────
     for i in range(len(vehicle_boxes)):
         for j in range(i+1, len(vehicle_boxes)):
-            tid_a, _, *box_a = vehicle_boxes[i]
-            tid_b, _, *box_b = vehicle_boxes[j]
-            iou = compute_iou(box_a, box_b)
-            if iou > COLLISION_IOU_THRESHOLD:
-                flagged_ids.add(tid_a); flagged_ids.add(tid_b)
-                la = VEHICLE_LABELS.get(vehicle_boxes[i][1], "VEHICLE")
-                lb = VEHICLE_LABELS.get(vehicle_boxes[j][1], "VEHICLE")
-                accident_reason = f"{la} vs {lb} collision (IoU {iou:.2f})"
+            tid_a, cls_a, *box_a = vehicle_boxes[i]
+            tid_b, cls_b, *box_b = vehicle_boxes[j]
+            box_iou = compute_iou(box_a, box_b)
+            la = VEHICLE_LABELS.get(cls_a, "VEHICLE")
+            lb = VEHICLE_LABELS.get(cls_b, "VEHICLE")
 
+            if box_iou < BOX_IOU_SEG_TRIGGER:
+                continue
+
+            if segmentation_enabled:
+                # ── Segmentation path ─────────────────────────────────────────
+                seg_metrics["seg_triggers"] += 1
+                mask_a = masks_by_id.get(tid_a)
+                mask_b = masks_by_id.get(tid_b)
+                if mask_a is not None and mask_b is not None:
+                    overlap = compute_mask_overlap(mask_a, mask_b)
+                    if overlap >= MASK_OVERLAP_THRESHOLD:
+                        seg_metrics["mask_collisions"] += 1
+                        for tid in (tid_a, tid_b):
+                            frame_signals.setdefault(tid, set()).add("MASK_COLLISION")
+                        accident_reason = accident_reason or (
+                            f"{la} vs {lb} pixel collision "
+                            f"(mask={overlap:.2f} iou={box_iou:.2f})"
+                        )
+                    else:
+                        seg_metrics["fp_eliminated"] += 1
+                        continue   # masks said NO — skip velocity fallback too
+                else:
+                    # mask unavailable this frame — fall through to velocity
+                    pass
+
+            # ── Velocity convergence (segmentation OFF, or masks unavailable) ─
+            vs_a = vehicle_states.get(tid_a)
+            vs_b = vehicle_states.get(tid_b)
+            if vs_a and vs_b and vs_a["vel_vectors"] and vs_b["vel_vectors"]:
+                ca = vs_a["centroids"][-1]
+                cb = vs_b["centroids"][-1]
+                dx, dy = cb[0]-ca[0], cb[1]-ca[1]
+                dist   = np.hypot(dx, dy) + 1e-6
+                dx_n, dy_n = dx/dist, dy/dist
+                vxa, vya = vs_a["vel_vectors"][-1]
+                vxb, vyb = vs_b["vel_vectors"][-1]
+                conv = (vxa*dx_n+vya*dy_n)+(-vxb*dx_n-vyb*dy_n)
+                if conv > 1.0:
+                    for tid in (tid_a, tid_b):
+                        frame_signals.setdefault(tid, set()).add("MASK_COLLISION")
+                    accident_reason = accident_reason or (
+                        f"{la} vs {lb} converging (conv={conv:.1f}px/f)"
+                    )
+
+    # ── Signal 2: Velocity drop ───────────────────────────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
         vs    = vehicle_states.get(tid)
         label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        if vs is None: continue
-        if len(vs["velocities"]) >= 5:
-            avg_vel  = np.mean(list(vs["velocities"])[:-1])
-            curr_vel = vs["velocities"][-1]
-            if avg_vel > MIN_MOVING_VELOCITY and curr_vel < STOPPED_VELOCITY:
-                flagged_ids.add(tid)
-                accident_reason = accident_reason or f"{label} sudden stop"
-        if len(vs["headings"]) >= 3:
-            h_list = list(vs["headings"])
-            diff   = min(abs(h_list[-1]-h_list[-2]), 360-abs(h_list[-1]-h_list[-2]))
-            if diff > HEADING_CHANGE_THRESHOLD:
-                flagged_ids.add(tid)
-                accident_reason = accident_reason or f"{label} trajectory deviation"
-        if len(vs["bbox_ratios"]) >= 3:
-            ratios = list(vs["bbox_ratios"])
-            if abs(ratios[-1]-ratios[-2]) > BBOX_RATIO_CHANGE:
-                flagged_ids.add(tid)
-                accident_reason = accident_reason or f"{label} shape deformation"
+        if not vs or len(vs["velocities"]) < VELOCITY_BASELINE_FRAMES:
+            continue
+        vel_list = list(vs["velocities"])
+        baseline = vel_list[:-3]
+        curr_vel = np.mean(vel_list[-3:])
+        avg_base = np.mean(baseline)
+        std_base = np.std(baseline)
+        if (avg_base > MIN_MOVING_VELOCITY and
+                std_base < VELOCITY_BASELINE_MAX_STD and
+                curr_vel < avg_base * VELOCITY_DROP_RATIO):
+            frame_signals.setdefault(tid, set()).add("VELOCITY_DROP")
+            accident_reason = accident_reason or (
+                f"{label} abrupt stop (base={avg_base:.1f}→{curr_vel:.1f}px/f)"
+            )
 
-    for (vtid, cls_id, vx1, vy1, vx2, vy2) in vehicle_boxes:
-        vs    = vehicle_states.get(vtid)
-        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
-        moving = (vs and len(vs["velocities"]) >= 3 and
-                  np.mean(list(vs["velocities"])[-3:]) > MIN_MOVING_VELOCITY)
-        if not moving: continue
-        pad = PERSON_VEHICLE_OVERLAP_PAD
-        for (ptid, pcx, pcy) in person_boxes:
-            if (vx1-pad) <= pcx <= (vx2+pad) and (vy1-pad) <= pcy <= (vy2+pad):
-                flagged_ids.add(vtid)
-                accident_reason = accident_reason or f"Pedestrian impact by {label}"
-
-    confirmed_ids = set()
+    # ── Signal 3: Heading deviation ───────────────────────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
+        vs    = vehicle_states.get(tid)
+        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+        if not vs or len(vs["headings"]) < 3:
+            continue
+        diff = abs(vs["headings"][-1] - vs["headings"][-2])
+        diff = min(diff, 360 - diff)
+        vs["heading_dev_cnt"] = vs["heading_dev_cnt"]+1 if diff > HEADING_CHANGE_THRESHOLD else 0
+        if vs["heading_dev_cnt"] >= HEADING_SUSTAINED_FRAMES:
+            frame_signals.setdefault(tid, set()).add("TRAJECTORY_DEV")
+            accident_reason = accident_reason or (
+                f"{label} trajectory deviation ({diff:.0f}°)"
+            )
+
+    # ── Signal 4: Person-vehicle impact ──────────────────────────────────────
+    for ptid, pcx, pcy in person_boxes:
+        ps = person_states.setdefault(ptid, {"entry_time": None, "loiter_logged": False})
+        if "p_centroids" not in ps:
+            ps["p_centroids"]  = deque(maxlen=10)
+            ps["p_velocities"] = deque(maxlen=10)
+        ps["p_centroids"].append((pcx, pcy))
+        if len(ps["p_centroids"]) >= 2:
+            prev = ps["p_centroids"][-2]
+            ps["p_velocities"].append(np.hypot(pcx-prev[0], pcy-prev[1]))
+
+    for (tid, cls_id, vx1, vy1, vx2, vy2) in vehicle_boxes:
+        vs    = vehicle_states.get(tid)
+        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+        if not vs or len(vs["velocities"]) < 3:
+            continue
+        if np.mean(list(vs["velocities"])[-3:]) < MIN_MOVING_VELOCITY:
+            continue
+        pad = PERSON_VEHICLE_OVERLAP_PAD
+        for ptid, pcx, pcy in person_boxes:
+            if not ((vx1-pad) <= pcx <= (vx2+pad) and
+                    (vy1-pad) <= pcy <= (vy2+pad)):
+                continue
+            ps = person_states.get(ptid, {})
+            pv = list(ps.get("p_velocities", []))
+            if len(pv) >= 4:
+                if (np.mean(pv[-2:]) / (np.mean(pv[-4:-2])+1e-6)) < PERSON_DECEL_RATIO:
+                    frame_signals.setdefault(tid, set()).add("PEDESTRIAN_HIT")
+                    accident_reason = accident_reason or f"Pedestrian impact by {label}"
+
+    # ── Signal 5: Bbox deformation ────────────────────────────────────────────
+    for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
+        vs    = vehicle_states.get(tid)
+        label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+        if not vs or len(vs["bbox_ratios"]) < 6:
+            continue
+        ratios = list(vs["bbox_ratios"])
+        if abs(np.median(ratios[-3:]) - np.median(ratios[-6:-3])) > BBOX_RATIO_CHANGE:
+            frame_signals.setdefault(tid, set()).add("BBOX_DEFORM")
+            accident_reason = accident_reason or f"{label} shape deformation"
+
+    # ── Multi-signal temporal gate ────────────────────────────────────────────
+    confirmed_ids = set()
+    flagged_ids   = set()
+
+    for (tid, *_) in vehicle_boxes:
         vs = vehicle_states.get(tid)
-        if vs is None: continue
-        vs["accident_frames"] = vs["accident_frames"]+1 if tid in flagged_ids else 0
+        if vs is None:
+            continue
+        sigs = frame_signals.get(tid, set())
+        if len(sigs) >= MIN_SIGNALS_REQUIRED:
+            vs["active_signals"] |= sigs
+            vs["accident_frames"] += 1
+            flagged_ids.add(tid)
+        else:
+            vs["accident_frames"] = 0
+            vs["active_signals"]  = set()
         if vs["accident_frames"] >= ACCIDENT_CONFIRM_FRAMES:
             confirmed_ids.add(tid)
 
+    # ── Annotate ──────────────────────────────────────────────────────────────
     for (tid, cls_id, x1, y1, x2, y2) in vehicle_boxes:
         vs    = vehicle_states.get(tid)
         label = VEHICLE_LABELS.get(cls_id, "VEHICLE")
+
+        if segmentation_enabled and tid in masks_by_id and tid in (flagged_ids | confirmed_ids):
+            mask    = masks_by_id[tid]
+            overlay = frame.copy()
+            overlay[mask > 0] = [255, 255, 0]
+            cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
+
         if tid in confirmed_ids:
+            tag = "[SEG]" if segmentation_enabled else ""
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            cv2.putText(frame, f"ACCIDENT {label}", (x1, y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cv2.putText(frame, f"ACCIDENT {label} {tag}",
+                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 0, 255), 2)
             accident_detected = True
         elif tid in flagged_ids and vs:
+            sigs = "+".join(sorted(vs["active_signals"])) or "?"
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 140, 255), 2)
-            cv2.putText(frame, f"Alert? ({vs['accident_frames']}/{ACCIDENT_CONFIRM_FRAMES})",
-                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+            cv2.putText(frame,
+                        f"{sigs} ({vs['accident_frames']}/{ACCIDENT_CONFIRM_FRAMES})",
+                        (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 140, 255), 2)
 
     if accident_detected:
-        cv2.putText(frame, "ACCIDENT DETECTED", (30, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 0, 255), 3)
+        tag = "SEG ON" if segmentation_enabled else "SEG OFF"
+        cv2.putText(frame, f"ACCIDENT DETECTED [{tag}]",
+                    (30, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                    1.1, (0, 0, 255), 3)
 
     return accident_detected, frame, accident_reason
 
@@ -547,65 +547,23 @@ def toggle_accident():
     accident_detection_enabled = not accident_detection_enabled
     return jsonify({"enabled": accident_detection_enabled})
 
-@app.route("/toggle_face", methods=["POST"])
-def toggle_face():
-    global face_recognition_enabled
-    face_recognition_enabled = not face_recognition_enabled
-    return jsonify({"enabled": face_recognition_enabled})
+@app.route("/toggle_segmentation", methods=["POST"])
+def toggle_segmentation():
+    """
+    Toggle pixel-level mask segmentation for accident detection.
 
-@app.route("/faces")
-def list_faces():
+    OFF → accident detection uses converging velocity only (faster, Phase 1)
+    ON  → accident detection uses pixel mask intersection (precise, Phase 2)
+
+    Fall detection is completely unaffected by this toggle.
+    Masks are only extracted when BOTH accident AND segmentation are enabled.
+    """
+    global segmentation_enabled
+    segmentation_enabled = not segmentation_enabled
     return jsonify({
-        "users": face_auth.list_users(),
-        "trained": face_auth.is_trained,
+        "enabled": segmentation_enabled,
+        "mode": "Phase 2 [Pixel Masks]" if segmentation_enabled else "Phase 1 [Velocity]"
     })
-
-@app.route("/enroll_face", methods=["POST"])
-def enroll_face():
-    """
-    FormData:
-      - name: string
-      - image: file
-    """
-    name = (request.form.get("name") or "").strip()
-    file = request.files.get("image")
-    if not name or file is None:
-        return jsonify({"error": "Missing name or image"}), 400
-
-    data = file.read()
-    if not data:
-        return jsonify({"error": "Empty upload"}), 400
-
-    arr = np.frombuffer(data, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        return jsonify({"error": "Invalid image"}), 400
-
-    ok = face_auth.enroll_image(name, img)
-    if not ok:
-        return jsonify({"error": "Failed to save image"}), 500
-
-    stats = face_auth.retrain()
-    event_logs.append({
-        "type": "FACE_ENROLL",
-        "time": time.strftime("%H:%M:%S"),
-        "details": f"Enrolled authorized face: {name} (labels={stats['labels']}, used={stats['used_faces']})",
-    })
-    return jsonify({"status": "enrolled", "stats": stats})
-
-@app.route("/delete_face", methods=["POST"])
-def delete_face():
-    """
-    JSON:
-      - name: string
-    """
-    name = (request.json or {}).get("name", "")
-    name = str(name).strip()
-    if not name:
-        return jsonify({"error": "Missing name"}), 400
-    deleted = face_auth.delete_user(name)
-    stats = face_auth.retrain()
-    return jsonify({"deleted": deleted, "stats": stats})
 
 @app.route("/export_logs_csv")
 def export_logs_csv():
@@ -618,8 +576,10 @@ def export_logs_csv():
     buf = io.BytesIO()
     buf.write(output.getvalue().encode("utf-8"))
     buf.seek(0)
-    return send_file(buf, mimetype="text/csv", as_attachment=True,
-                     download_name=f"safesight_logs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    return send_file(
+        buf, mimetype="text/csv", as_attachment=True,
+        download_name=f"safesight_logs_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    )
 
 @app.route("/snapshots")
 def list_snapshots():
@@ -629,14 +589,31 @@ def list_snapshots():
         for f in files if f.endswith(".jpg")
     ])
 
+@app.route("/seg_metrics")
+def get_seg_metrics():
+    return jsonify(seg_metrics)
+
+@app.route("/status")
+def get_status():
+    """Returns all toggle states — used by dashboard to sync button labels."""
+    return jsonify({
+        "crowd":        crowd_detection_enabled,
+        "fire":         fire_detection_enabled,
+        "fall":         fall_detection_enabled,
+        "accident":     accident_detection_enabled,
+        "segmentation": segmentation_enabled,
+    })
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(generate_frames(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(
+        generate_frames(),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
 
 @app.route("/events")
 def events():
@@ -669,12 +646,18 @@ def generate_frames():
         fire_detected = False
         vehicle_boxes = []
         person_boxes  = []
-        person_bboxes = []   # (track_id, x1, y1, x2, y2) for fall detection
+        masks_by_id   = {}
 
         for result in results:
             frame = result.plot(conf=False)
             if roi_polygon is not None:
                 cv2.polylines(frame, [roi_polygon], True, (255, 0, 0), 2)
+
+            # Masks extracted ONLY when both accident AND segmentation are ON
+            # This is the key gate — fall detection is never affected
+            if accident_detection_enabled and segmentation_enabled:
+                frame_masks = YOLODetector.extract_masks(result, frame.shape)
+                masks_by_id.update(frame_masks)
 
             for box in result.boxes:
                 if box.id is None:
@@ -687,14 +670,10 @@ def generate_frames():
                 if cls_id == 0:
                     tracked_ids.add(track_id)
                     person_boxes.append((track_id, cx, cy))
-                    person_bboxes.append((track_id, x1, y1, x2, y2))
 
                     if track_id not in person_states:
                         person_states[track_id] = {
-                            "entry_time": None,
-                            "loiter_logged": False,
-                            "authorized": False,
-                            "last_face_check": 0.0,
+                            "entry_time": None, "loiter_logged": False
                         }
                     state  = person_states[track_id]
                     inside = -1
@@ -703,44 +682,6 @@ def generate_frames():
 
                     if inside >= 0:
                         now = time.time()
-                        # ── Face auth gate (STRICT) ────────────────────────────
-                        if face_recognition_enabled:
-                            # Only check periodically per track to keep FPS up
-                            if (now - float(state.get("last_face_check", 0.0))) >= FACE_CHECK_INTERVAL_SEC:
-                                state["last_face_check"] = now
-                                # Crop top portion of person bbox (more likely to include face)
-                                H, W = frame.shape[:2]
-                                px1 = max(0, x1)
-                                py1 = max(0, y1)
-                                px2 = min(W, x2)
-                                py2 = min(H, y2)
-                                # Focus on upper 60% of the person box
-                                upper_h = int((py2 - py1) * 0.6)
-                                py2u = min(H, py1 + max(upper_h, 1))
-                                crop = frame[py1:py2u, px1:px2]
-                                name, conf, face_visible = face_auth.identify_from_bgr(
-                                    crop, threshold=FACE_MATCH_THRESHOLD
-                                )
-                                if name:
-                                    state["authorized"] = True
-                                    event_logs.append({
-                                        "type": "AUTHORIZED_ENTRY",
-                                        "time": time.strftime("%H:%M:%S"),
-                                        "details": f"{name} authorized in ROI (Person ID {track_id}, conf={conf:.1f})",
-                                    })
-                                else:
-                                    # Strict mode: no face visible OR not recognized => unauthorized
-                                    state["authorized"] = False
-
-                        # If authorized, skip intrusion/loitering alerts
-                        if face_recognition_enabled and state.get("authorized"):
-                            cv2.putText(frame, "AUTHORIZED", (x1, y1-10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                            # Do not set entry_time for loitering when authorized
-                            state["entry_time"] = None
-                            state["loiter_logged"] = False
-                            continue
-
                         if state["entry_time"] is None:
                             state["entry_time"] = now
                             if now - last_intrusion_time > INTRUSION_COOLDOWN:
@@ -765,7 +706,6 @@ def generate_frames():
                     else:
                         state["entry_time"]    = None
                         state["loiter_logged"] = False
-                        state["authorized"]    = False
 
                 elif cls_id in VEHICLE_CLASSES:
                     vehicle_boxes.append((track_id, cls_id, x1, y1, x2, y2))
@@ -795,8 +735,8 @@ def generate_frames():
                 save_snapshot("CROWD")
 
         # ── Fall ──────────────────────────────────────────────────────────────
-        if fall_detection_enabled and person_bboxes:
-            fall_confirmed, frame = detect_fall(frame, person_bboxes)
+        if fall_detection_enabled:
+            fall_confirmed, frame = detect_fall(frame)
             if fall_confirmed and time.time() - last_fall_log_time > FALL_LOG_COOLDOWN:
                 event_logs.append({"type": "FALL", "time": time.strftime("%H:%M:%S"),
                                    "details": "Person fall detected in monitored area"})
@@ -808,7 +748,7 @@ def generate_frames():
         # ── Accident ──────────────────────────────────────────────────────────
         if accident_detection_enabled and vehicle_boxes:
             acc_detected, frame, acc_reason = detect_accidents(
-                frame, vehicle_boxes, person_boxes
+                frame, vehicle_boxes, person_boxes, masks_by_id
             )
             if acc_detected and time.time() - last_accident_time > ACCIDENT_LOG_COOLDOWN:
                 event_logs.append({
