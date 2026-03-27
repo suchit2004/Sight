@@ -1,4 +1,10 @@
 {
-  "label_to_id": {},
-  "id_to_label": {}
+  "label_to_id": {
+    "jundare": 1,
+    "jundare1": 2
+  },
+  "id_to_label": {
+    "1": "jundare",
+    "2": "jundare1"
+  }
 }
