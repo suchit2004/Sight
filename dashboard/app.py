@@ -9,6 +9,7 @@ import threading
 import winsound
 import mediapipe
 import cv2
+import requests
 from mediapipe.python.solutions.pose import Pose as MediaPipePose
 from flask import Flask, render_template, Response, jsonify, request, send_file, send_from_directory
 
@@ -43,15 +44,15 @@ CROWD_THRESHOLD = 5
 CROWD_COOLDOWN = 10
 crowd_detection_enabled = False
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FIRE
-# ─────────────────────────────────────────────
+# ─────────────────────────
 fire_detection_enabled = False
 FIRE_LOG_COOLDOWN = 10
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FALL
-# ─────────────────────────────────────────────
+# ─────────────────────────
 fall_detection_enabled = False
 FALL_LOG_COOLDOWN = 10
 FALL_SHOULDER_SPREAD_RATIO = 0.15
@@ -60,14 +61,14 @@ FALL_SPREAD_RATIO = 1.4
 FALL_CONFIRM_FRAMES = 3
 MIN_KEYPOINT_VISIBILITY = 0.2
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # ROI
-# ─────────────────────────────────────────────
+# ─────────────────────────
 roi_polygon = None
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # SNAPSHOTS
-# ─────────────────────────────────────────────
+# ─────────────────────────
 SNAPSHOT_DIR = os.path.join(BASE_DIR, "static", "snapshots")
 os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
@@ -84,9 +85,58 @@ last_snapshot_time = {
 SNAPSHOT_COOLDOWN = 10
 fall_frame_counter = 0
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
+# TELEGRAM ALERT SYSTEM
+# ─────────────────────────
+
+BOT_TOKEN = "8519889948:AAHUtjJKC-oxVuaySf2bLKCviMVNSq0aWjo"
+CHAT_ID = "1368117160"
+
+ALERT_COOLDOWN = 5
+last_alert_time = 0
+
+
+def send_alert(message):
+
+    global last_alert_time
+
+    if time.time() - last_alert_time < ALERT_COOLDOWN:
+        return
+
+    try:
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+        requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": message
+        })
+
+        last_alert_time = time.time()
+
+    except:
+        pass
+
+
+def send_image(frame):
+
+    try:
+
+        _, img = cv2.imencode('.jpg', frame)
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+
+        requests.post(
+            url,
+            data={"chat_id": CHAT_ID},
+            files={"photo": img.tobytes()}
+        )
+
+    except:
+        pass
+# ─────────────────────────
 # MEDIAPIPE
-# ─────────────────────────────────────────────
+# ─────────────────────────
 pose_model = MediaPipePose(
     static_image_mode=False,
     model_complexity=0,
@@ -103,13 +153,13 @@ KP_RIGHT_HIP = 24
 KP_LEFT_ANKLE = 27
 KP_RIGHT_ANKLE = 28
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # VIDEO
-# ─────────────────────────────────────────────
-cap = cv2.VideoCapture(0)
-#cap = cv2.VideoCapture("../data/CLASS.mp4")
+# ─────────────────────────
+#cap = cv2.VideoCapture(0)
+cap = cv2.VideoCapture("../data/CROWD.mp4")
 detector = YOLODetector()
-# ─── FACE RECOGNITION ─────────────────────────
+# ─── FACE RECOGNITION ───────────────
 
 face_detector = cv2.CascadeClassifier(
     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
@@ -121,9 +171,9 @@ label_map = {}
 current_label = 0
 face_recognition_enabled = False
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # METRICS
-# ─────────────────────────────────────────────
+# ─────────────────────────
 metrics = {
     "fps": 0,
     "latency_ms": 0,
@@ -142,9 +192,9 @@ model_metrics = {
     "f1_score": 0.88,
 }
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # UTILITIES
-# ─────────────────────────────────────────────
+# ─────────────────────────
 
 def play_alert_sound():
     def _beep():
@@ -206,7 +256,7 @@ def recognize_face(frame, x1, y1, x2, y2):
 
         label, confidence = face_recognizer.predict(face_roi)
 
-        if confidence < 80:
+        if confidence < 70:
             return label_map.get(label, "Unknown")
 
     return "Unknown"
@@ -237,9 +287,9 @@ def save_snapshot(event_type):
     })
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FIRE DETECTION
-# ─────────────────────────────────────────────
+# ─────────────────────────
 
 def detect_fire_color(frame):
 
@@ -276,9 +326,9 @@ def detect_fire_color(frame):
     return boxes
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FALL DETECTION
-# ─────────────────────────────────────────────
+# ─────────────────────────
 
 def detect_fall(frame):
 
@@ -373,9 +423,9 @@ def detect_fall(frame):
     return fall_confirmed, frame
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FLASK ROUTES
-# ─────────────────────────────────────────────
+# ─────────────────────────
 
 @app.route("/set_roi", methods=["POST"])
 def set_roi():
@@ -495,9 +545,106 @@ def live_metrics():
     return jsonify({"system": metrics, "model": model_metrics})
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────
 # FRAME GENERATOR
-# ─────────────────────────────────────────────
+# ─────────────────────────
+# ─────────────────────────
+# ADVANCED CROWD DETECTION
+# ─────────────────────────
+
+GRID_ROWS = 3
+GRID_COLS = 3
+
+CROWD_DENSITY_THRESHOLD = 3
+HEATMAP_ENABLED = True
+
+
+def detect_crowd_advanced(frame, person_centers):
+
+    h, w = frame.shape[:2]
+
+    cell_w = w // GRID_COLS
+    cell_h = h // GRID_ROWS
+
+    grid_counts = [[0]*GRID_COLS for _ in range(GRID_ROWS)]
+
+    for (_, cx, cy) in person_centers:
+
+        row = min(cy // cell_h, GRID_ROWS-1)
+        col = min(cx // cell_w, GRID_COLS-1)
+
+        grid_counts[row][col] += 1
+
+    high_density = False
+
+    if HEATMAP_ENABLED:
+
+        heatmap = np.zeros((h, w), dtype=np.float32)
+
+        for (_, cx, cy) in person_centers:
+
+            cv2.circle(
+                heatmap,
+                (cx, cy),
+                50,
+                1,
+                -1
+            )
+
+        heatmap = cv2.GaussianBlur(
+            heatmap,
+            (51,51),
+            0
+        )
+
+        heatmap = np.clip(heatmap, 0, 1)
+
+        colored = cv2.applyColorMap(
+            (heatmap*255).astype(np.uint8),
+            cv2.COLORMAP_JET
+        )
+
+        frame = cv2.addWeighted(
+            frame,
+            0.7,
+            colored,
+            0.3,
+            0
+        )
+
+    for r in range(GRID_ROWS):
+
+        for c in range(GRID_COLS):
+
+            if grid_counts[r][c] >= CROWD_DENSITY_THRESHOLD:
+
+                high_density = True
+
+                x1 = c * cell_w
+                y1 = r * cell_h
+                x2 = x1 + cell_w
+                y2 = y1 + cell_h
+
+                cv2.rectangle(
+                    frame,
+                    (x1, y1),
+                    (x2, y2),
+                    (0,0,255),
+                    3
+                )
+
+                cv2.putText(
+                    frame,
+                    "HIGH DENSITY",
+                    (x1, y1-5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0,0,255),
+                    2
+                )
+
+    return high_density, frame
+
 
 def generate_frames():
 
@@ -519,6 +666,8 @@ def generate_frames():
 
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
+
+        frame = cv2.resize(frame, (960, 540))
 
         results = detector.detect(frame)
 
@@ -561,17 +710,17 @@ def generate_frames():
                     person_name = "Unknown"
 
                     if face_recognition_enabled:
-                      person_name = recognize_face(frame, x1, y1, x2, y2)
+                        person_name = recognize_face(frame, x1, y1, x2, y2)
 
-                      cv2.putText(
-                        frame,
-                        person_name,
-                        (x1, y2 + 20),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7,
-                        (0, 255, 0),
-                        2
-                     )
+                        cv2.putText(
+                            frame,
+                            person_name,
+                            (x1, y2 + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2
+                        )
 
                     tracked_ids.add(track_id)
 
@@ -599,7 +748,7 @@ def generate_frames():
                         now = time.time()
                         if face_recognition_enabled and person_name != "Unknown":
                         # Authorized → ignore intrusion
-                         continue
+                            continue
                         if state["entry_time"] is None:
 
                             state["entry_time"] = now
@@ -617,6 +766,8 @@ def generate_frames():
                                 last_intrusion_time = now
 
                                 save_snapshot("INTRUSION")
+                                send_alert("🚨 Intrusion detected")
+                                #send_image(frame)
 
                         dwell = now - state["entry_time"]
 
@@ -676,17 +827,44 @@ def generate_frames():
             last_fire_log_time = time.time()
 
             save_snapshot("FIRE")
-
+            send_alert("🚨 Fire detected")
+            #send_image(frame)
         metrics["person_count"] = len(tracked_ids)
 
-        if crowd_detection_enabled and metrics["person_count"] >= CROWD_THRESHOLD:
+        person_centers = []
 
-            if time.time() - last_crowd_log_time > CROWD_COOLDOWN:
+        for result in results:
+
+            for box in result.boxes:
+
+                if box.id is None:
+                    continue
+
+                cls_id = int(box.cls[0])
+
+                if cls_id == 0:
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+
+                    person_centers.append((0, cx, cy))
+
+
+        if crowd_detection_enabled:
+
+            high_density, frame = detect_crowd_advanced(
+                frame,
+                person_centers
+            )
+
+            if high_density and time.time() - last_crowd_log_time > CROWD_COOLDOWN:
 
                 event_logs.append({
                     "type": "CROWD",
                     "time": time.strftime("%H:%M:%S"),
-                    "details": f"High crowd density ({metrics['person_count']})"
+                    "details": "High crowd density detected"
                 })
 
                 metrics["crowd_alerts"] += 1
@@ -694,22 +872,27 @@ def generate_frames():
                 last_crowd_log_time = time.time()
 
                 save_snapshot("CROWD")
+                send_alert("🚨 Crowd detected")
+                #send_image(frame)
+                send_alert("🚨 High Crowd Density Detected")
+
+                #send_image(frame)
 
         if fall_detection_enabled:
 
             fall_confirmed, pose_frame = detect_fall(clean_frame)
 
-# overlay fall text on main frame if detected
+            # overlay fall text on main frame if detected
             if fall_confirmed:
-             cv2.putText(
-             frame,
-             "FALL DETECTED",
-             (30, 60),
-             cv2.FONT_HERSHEY_SIMPLEX,
-             1.4,
-             (0, 0, 255),
-             3
-             )
+                cv2.putText(
+                    frame,
+                    "FALL DETECTED",
+                    (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.4,
+                    (0, 0, 255),
+                    3
+                )
 
             if fall_confirmed and time.time() - last_fall_log_time > FALL_LOG_COOLDOWN:
 
@@ -724,6 +907,8 @@ def generate_frames():
                 last_fall_log_time = time.time()
 
                 save_snapshot("FALL")
+                send_alert("🚨 FALL detected")
+                #send_image(frame)
 
                 play_alert_sound()
 

@@ -20,7 +20,7 @@ class YOLODetector:
             frame,
             stream=True,
             persist=True,
-            conf=0.5,
+            conf=0.4,
             iou=0.6,
             device=0
         )
