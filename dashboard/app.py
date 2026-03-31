@@ -89,8 +89,8 @@ fall_frame_counter = 0
 # TELEGRAM ALERT SYSTEM
 # ─────────────────────────
 
-BOT_TOKEN = "8519889948:AAHUtjJKC-oxVuaySf2bLKCviMVNSq0aWjo"
-CHAT_ID = "1368117160"
+BOT_TOKEN = "Your token"
+CHAT_ID = "Your id"
 
 ALERT_COOLDOWN = 5
 last_alert_time = 0
