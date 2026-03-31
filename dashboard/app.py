@@ -32,15 +32,13 @@ last_crowd_log_time = 0
 last_fire_log_time = 0
 last_fall_log_time = 0
 
-# ─────────────────────────────────────────────
 # INTRUSION
-# ─────────────────────────────────────────────
+
 INTRUSION_COOLDOWN = 5
 LOITERING_TIME_THRESHOLD = 10
 
-# ─────────────────────────────────────────────
 # CROWD
-# ─────────────────────────────────────────────
+
 CROWD_THRESHOLD = 5
 CROWD_COOLDOWN = 10
 crowd_detection_enabled = False
@@ -108,8 +106,8 @@ KP_RIGHT_ANKLE = 28
 # ─────────────────────────────────────────────
 # VIDEO
 # ─────────────────────────────────────────────
-#cap = cv2.VideoCapture(0)
-cap = cv2.VideoCapture("../data/CLASS.mp4")
+cap = cv2.VideoCapture(0)
+#cap = cv2.VideoCapture("../data/CLASS.mp4")
 detector = YOLODetector()
 # ─── FACE RECOGNITION ─────────────────────────
 
