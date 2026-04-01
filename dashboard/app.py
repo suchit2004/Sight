@@ -88,9 +88,8 @@ fall_frame_counter = 0
 # ─────────────────────────
 # TELEGRAM ALERT SYSTEM
 # ─────────────────────────
-
-BOT_TOKEN = "Your token"
-CHAT_ID = "Your id"
+BOT_TOKEN = "Put here"
+CHAT_ID = "Put here"
 
 ALERT_COOLDOWN = 5
 last_alert_time = 0
@@ -105,7 +104,7 @@ def send_alert(message):
 
     try:
 
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        url = f"https://api.telegram.org/bot8519889948:AAHUtjJKC-oxVuaySf2bLKCviMVNSq0aWjo/getUpdates"
 
         requests.post(url, data={
             "chat_id": CHAT_ID,
@@ -156,8 +155,8 @@ KP_RIGHT_ANKLE = 28
 # ─────────────────────────
 # VIDEO
 # ─────────────────────────
-#cap = cv2.VideoCapture(0)
-cap = cv2.VideoCapture("../data/CROWD.mp4")
+cap = cv2.VideoCapture(0)
+#cap = cv2.VideoCapture("../data/CLIP1.mp4")
 detector = YOLODetector()
 # ─── FACE RECOGNITION ───────────────
 
@@ -667,7 +666,7 @@ def generate_frames():
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             continue
 
-        frame = cv2.resize(frame, (960, 540))
+        #frame = cv2.resize(frame, (960, 540))
 
         results = detector.detect(frame)
 
@@ -767,7 +766,7 @@ def generate_frames():
 
                                 save_snapshot("INTRUSION")
                                 send_alert("🚨 Intrusion detected")
-                                #send_image(frame)
+                                send_image(frame)
 
                         dwell = now - state["entry_time"]
 
@@ -828,7 +827,7 @@ def generate_frames():
 
             save_snapshot("FIRE")
             send_alert("🚨 Fire detected")
-            #send_image(frame)
+            send_image(frame)
         metrics["person_count"] = len(tracked_ids)
 
         person_centers = []
@@ -873,7 +872,7 @@ def generate_frames():
 
                 save_snapshot("CROWD")
                 send_alert("🚨 Crowd detected")
-                #send_image(frame)
+                send_image(frame)
                 send_alert("🚨 High Crowd Density Detected")
 
                 #send_image(frame)
@@ -908,7 +907,7 @@ def generate_frames():
 
                 save_snapshot("FALL")
                 send_alert("🚨 FALL detected")
-                #send_image(frame)
+                send_image(frame)
 
                 play_alert_sound()
 
